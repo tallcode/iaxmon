@@ -15,3 +15,7 @@ node = "1999"
 
 [audio]
 codec = "ulaw"
+
+[activity]
+threshold = 50.0   # RMS 阈值，超过即判定有人上话
+hang_ms = 500      # 静音多久判定上话结束

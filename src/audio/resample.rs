@@ -20,7 +20,13 @@ pub struct Resampler {
 
 impl Resampler {
     pub fn new(in_rate: u32, out_rate: u32) -> Self {
-        Self { in_rate, out_rate, pos_int: 0, pos_num: 0, prev: 0.0 }
+        Self {
+            in_rate,
+            out_rate,
+            pos_int: 0,
+            pos_num: 0,
+            prev: 0.0,
+        }
     }
 
     /// 把一块 i16 输入重采样成 f32 追加到 `out`。
@@ -32,7 +38,11 @@ impl Resampler {
         // 虚拟输入序列 = [prev, input...]，长度 input.len()+1。
         // pos_int ∈ [0, len) 保证插值要用的 i 和 i+1 都在这个序列内。
         let sample = |i: usize| -> f32 {
-            if i == 0 { self.prev } else { input[i - 1] as f32 / 32768.0 }
+            if i == 0 {
+                self.prev
+            } else {
+                input[i - 1] as f32 / 32768.0
+            }
         };
 
         let len = input.len();

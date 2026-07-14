@@ -82,7 +82,11 @@ fn 金标_ie_类型() {
 /// CAUSECODE 是 0x2a。0x2f 是 RR_LOSS(u32)，两者都在错误处理路径上，极易混淆。
 #[test]
 fn 金标_causecode_不是_rr_loss() {
-    assert_eq!(ie::CAUSE_CODE, 0x2a, "CAUSECODE 必须是 0x2a；0x2f 是 RR_LOSS");
+    assert_eq!(
+        ie::CAUSE_CODE,
+        0x2a,
+        "CAUSECODE 必须是 0x2a；0x2f 是 RR_LOSS"
+    );
     assert_ne!(ie::CAUSE_CODE, 0x2f);
 }
 
@@ -155,7 +159,11 @@ fn 子类压缩_合法子类往返() {
     for subclass in cases {
         let csub = compress_subclass(subclass)
             .unwrap_or_else(|e| panic!("合法子类 0x{subclass:x} 压不了: {e}"));
-        assert_eq!(uncompress_subclass(csub), subclass, "子类 0x{subclass:x} 往返不一致");
+        assert_eq!(
+            uncompress_subclass(csub),
+            subclass,
+            "子类 0x{subclass:x} 往返不一致"
+        );
     }
 }
 
@@ -183,7 +191,10 @@ fn 子类压缩_任意_csub_都能解压() {
 #[test]
 fn 子类压缩_非二次幂的大子类不可编码() {
     for subclass in [0x81u32, 0x1234, 0xffff, 0x8000_0001] {
-        assert!(compress_subclass(subclass).is_err(), "0x{subclass:x} 不该能压缩");
+        assert!(
+            compress_subclass(subclass).is_err(),
+            "0x{subclass:x} 不该能压缩"
+        );
     }
 }
 
@@ -252,7 +263,9 @@ fn 线格式_重传标志位() {
     let bytes = f.encode().unwrap();
     assert_eq!(&bytes[2..4], &[0xd6, 0x78], "R 位应置于 dest 字段最高位");
 
-    let Frame::Full(back) = Frame::parse(&bytes).unwrap() else { panic!() };
+    let Frame::Full(back) = Frame::parse(&bytes).unwrap() else {
+        panic!()
+    };
     assert!(back.retransmit);
     assert_eq!(back.dest_call, 0x5678, "R 位不能污染呼叫号");
 }
@@ -260,16 +273,29 @@ fn 线格式_重传标志位() {
 /// Mini frame 头 4 字节，F=0。
 #[test]
 fn 线格式_mini_frame_头() {
-    let f = MiniFrame { source_call: 0x1234, timestamp: 0xabcd, payload: vec![0x01, 0x02] };
-    assert_eq!(f.encode().unwrap(), vec![0x12, 0x34, 0xab, 0xcd, 0x01, 0x02]);
+    let f = MiniFrame {
+        source_call: 0x1234,
+        timestamp: 0xabcd,
+        payload: vec![0x01, 0x02],
+    };
+    assert_eq!(
+        f.encode().unwrap(),
+        vec![0x12, 0x34, 0xab, 0xcd, 0x01, 0x02]
+    );
 }
 
 /// F=0 且呼叫号为 0 是 meta 帧，必须先于 mini frame 判断，否则会误解析。
 #[test]
 fn 线格式_meta_帧优先于_mini_识别() {
-    assert_eq!(Frame::parse(&[0x00, 0x00, 0x12, 0x34, 0xaa]).unwrap(), Frame::Meta);
+    assert_eq!(
+        Frame::parse(&[0x00, 0x00, 0x12, 0x34, 0xaa]).unwrap(),
+        Frame::Meta
+    );
     // 呼叫号非 0 才是 mini
-    assert!(matches!(Frame::parse(&[0x00, 0x01, 0x12, 0x34]).unwrap(), Frame::Mini(_)));
+    assert!(matches!(
+        Frame::parse(&[0x00, 0x01, 0x12, 0x34]).unwrap(),
+        Frame::Mini(_)
+    ));
 }
 
 /// IE 线格式 `type | len | data`，数值大端。
@@ -301,14 +327,19 @@ fn 线格式_ie() {
 #[test]
 fn calltoken_空_ie_的线格式() {
     let mut ies = Ies::new();
-    ies.push(Ie { id: ie::CALLTOKEN, data: vec![] });
+    ies.push(Ie {
+        id: ie::CALLTOKEN,
+        data: vec![],
+    });
     let mut buf = Vec::new();
     ies.encode(&mut buf).unwrap();
     assert_eq!(buf, vec![0x36, 0x00]);
 
     // 解析回来必须是「存在且为空」，而不是「不存在」
     let parsed = Ies::parse(&buf).unwrap();
-    let token = parsed.get(ie::CALLTOKEN).expect("空 CALLTOKEN IE 必须能被解析出来");
+    let token = parsed
+        .get(ie::CALLTOKEN)
+        .expect("空 CALLTOKEN IE 必须能被解析出来");
     assert!(token.data.is_empty());
 }
 
@@ -317,7 +348,10 @@ fn calltoken_空_ie_的线格式() {
 fn calltoken_令牌原样往返() {
     let token: Vec<u8> = (0u8..=255).collect::<Vec<_>>()[..200].to_vec();
     let mut ies = Ies::new();
-    ies.push(Ie { id: ie::CALLTOKEN, data: token.clone() });
+    ies.push(Ie {
+        id: ie::CALLTOKEN,
+        data: token.clone(),
+    });
     let mut buf = Vec::new();
     ies.encode(&mut buf).unwrap();
 
@@ -331,11 +365,17 @@ fn calltoken_真实长度装得下() {
     let token = b"1752499200?0123456789abcdef0123456789abcdef01234567";
     assert_eq!(token.len(), 51);
     let mut ies = Ies::new();
-    ies.push(Ie { id: ie::CALLTOKEN, data: token.to_vec() });
+    ies.push(Ie {
+        id: ie::CALLTOKEN,
+        data: token.to_vec(),
+    });
     let mut buf = Vec::new();
     ies.encode(&mut buf).unwrap();
     assert_eq!(buf[1], 51);
-    assert_eq!(Ies::parse(&buf).unwrap().get(ie::CALLTOKEN).unwrap().data, token);
+    assert_eq!(
+        Ies::parse(&buf).unwrap().get(ie::CALLTOKEN).unwrap().data,
+        token
+    );
 }
 
 // ===========================================================================
@@ -351,9 +391,13 @@ fn calltoken_真实长度装得下() {
 /// 认得出这个特征，就能把「CallToken 没实现」和「真的被拒绝」区分开。
 #[test]
 fn 实包_calltoken_缺失时的裸_reject() {
-    let wire = [0x80, 0x01, 0x62, 0x4b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x06, 0x06];
+    let wire = [
+        0x80, 0x01, 0x62, 0x4b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x06, 0x06,
+    ];
 
-    let Frame::Full(f) = Frame::parse(&wire).unwrap() else { panic!("应解析为 full frame") };
+    let Frame::Full(f) = Frame::parse(&wire).unwrap() else {
+        panic!("应解析为 full frame")
+    };
     assert_eq!(f.source_call, 1, "apathetic reply 的源呼叫号是硬编码的 1");
     assert_eq!(f.dest_call, 0x624b, "回给我们的呼叫号");
     assert!(!f.retransmit);
@@ -362,7 +406,10 @@ fn 实包_calltoken_缺失时的裸_reject() {
     assert_eq!(f.iseqno, 1);
     assert_eq!(f.frame_type, frame_type::IAX);
     assert_eq!(f.subclass, iax::REJECT);
-    assert!(f.payload.is_empty(), "裸 REJECT 不含任何 IE —— 这正是 CallToken 问题的特征");
+    assert!(
+        f.payload.is_empty(),
+        "裸 REJECT 不含任何 IE —— 这正是 CallToken 问题的特征"
+    );
     assert_eq!(f.ies().unwrap().0.len(), 0);
 
     // 往返

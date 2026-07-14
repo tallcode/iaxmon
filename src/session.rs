@@ -1,13 +1,15 @@
 //! 呼叫状态机：握手、序列号、ACK、保活、收语音。
 
 use crate::audio::AudioSink;
+use crate::audio::activity::Activity;
 use crate::config::Config;
 use crate::proto::consts::{
-    IAX_PROTO_VERSION, auth_method, control, format, frame_type, ie as ie_id, iax,
+    IAX_PROTO_VERSION, auth_method, control, format, frame_type, iax, ie as ie_id,
 };
 use crate::proto::{Frame, FullFrame, Ie, Ies};
 use crate::transport::Transport;
 use anyhow::{Context, anyhow};
+use chrono::{DateTime, Local};
 use md5::{Digest, Md5};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::{MissedTickBehavior, interval, timeout};
@@ -138,6 +140,8 @@ pub struct Session<'a> {
     /// 收到 CONTROL/ANSWER 之后为 true。决定用哪个静默阈值 —— 振铃期和通话期
     /// 服务端的发包节奏完全不同，不能用同一把尺子量。
     answered: bool,
+    /// 本次上话的起始墙上时间，用于打出「起止」
+    activity_start: Option<DateTime<Local>>,
 }
 
 impl<'a> Session<'a> {
@@ -153,12 +157,13 @@ impl<'a> Session<'a> {
             start: Instant::now(),
             clock: VoiceClock::default(),
             answered: false,
+            activity_start: None,
         })
     }
 
     /// NEW → (CALLTOKEN → NEW) → AUTHREQ → AUTHREP → ACCEPT
     pub async fn handshake(&mut self) -> Result<()> {
-        tracing::info!("呼叫 {} @ {}", self.cfg.call.node, self.transport.peer());
+        tracing::debug!("呼叫 {} @ {}", self.cfg.call.node, self.transport.peer());
 
         let ies = new_ies(self.cfg, &[]);
         let reply = self.send_reliable(frame_type::IAX, iax::NEW, ies).await?;
@@ -174,7 +179,10 @@ impl<'a> Session<'a> {
                 .context("CALLTOKEN 帧里没有 CALLTOKEN IE")?
                 .data
                 .clone();
-            tracing::debug!("服务端要求呼叫令牌 ({} 字节)，带上令牌重发 NEW", token.len());
+            tracing::debug!(
+                "服务端要求呼叫令牌 ({} 字节)，带上令牌重发 NEW",
+                token.len()
+            );
 
             self.oseqno = 0;
             self.iseqno = 0;
@@ -189,9 +197,17 @@ impl<'a> Session<'a> {
             (frame_type::IAX, iax::AUTHREQ) => reply,
             (frame_type::IAX, iax::REJECT) => {
                 // 呼叫被拒，多半是 CALLED NUMBER 不对。带上服务端给的原因。
-                return Err(SessionError::Retry(anyhow!("呼叫被拒绝: {}", cause_of(&reply))));
+                return Err(SessionError::Retry(anyhow!(
+                    "呼叫被拒绝: {}",
+                    cause_of(&reply)
+                )));
             }
-            _ => return Err(SessionError::Retry(anyhow!("NEW 之后收到意外的 {}", describe(&reply)))),
+            _ => {
+                return Err(SessionError::Retry(anyhow!(
+                    "NEW 之后收到意外的 {}",
+                    describe(&reply)
+                )));
+            }
         };
         self.adopt(&authreq);
 
@@ -206,12 +222,19 @@ impl<'a> Session<'a> {
                 "服务端不接受 MD5 认证 (AUTHMETHODS=0x{methods:04x})，本客户端只实现了 MD5"
             )));
         }
-        let challenge =
-            ies.get(ie_id::CHALLENGE).context("AUTHREQ 缺少 CHALLENGE")?.as_string();
+        let challenge = ies
+            .get(ie_id::CHALLENGE)
+            .context("AUTHREQ 缺少 CHALLENGE")?
+            .as_string();
 
         let mut ies = Ies::new();
-        ies.push(Ie::string(ie_id::MD5_RESULT, &md5_response(&challenge, &self.cfg.auth.secret)));
-        let reply = self.send_reliable(frame_type::IAX, iax::AUTHREP, ies).await?;
+        ies.push(Ie::string(
+            ie_id::MD5_RESULT,
+            &md5_response(&challenge, &self.cfg.auth.secret),
+        ));
+        let reply = self
+            .send_reliable(frame_type::IAX, iax::AUTHREP, ies)
+            .await?;
 
         let accept = match (reply.frame_type, reply.subclass) {
             (frame_type::IAX, iax::ACCEPT) => reply,
@@ -223,14 +246,20 @@ impl<'a> Session<'a> {
                 )));
             }
             _ => {
-                return Err(SessionError::Retry(anyhow!("AUTHREP 之后收到意外的 {}", describe(&reply))));
+                return Err(SessionError::Retry(anyhow!(
+                    "AUTHREP 之后收到意外的 {}",
+                    describe(&reply)
+                )));
             }
         };
         self.adopt(&accept);
         self.send_ack(accept.timestamp).await?;
 
         // ACCEPT 里的 FORMAT 是服务端最终选定的编码。不是 ulaw 我们解不了。
-        if let Some(fmt) = accept.ies().ok().and_then(|i| i.get(ie_id::FORMAT).and_then(|ie| ie.as_u32().ok()))
+        if let Some(fmt) = accept
+            .ies()
+            .ok()
+            .and_then(|i| i.get(ie_id::FORMAT).and_then(|ie| ie.as_u32().ok()))
             && fmt != format::ULAW
         {
             return Err(SessionError::Fatal(anyhow!(
@@ -239,7 +268,11 @@ impl<'a> Session<'a> {
             )));
         }
 
-        tracing::info!("呼叫已接受 (call {} ↔ {})", self.source_call, self.dest_call);
+        tracing::debug!(
+            "呼叫已接受 (call {} ↔ {})",
+            self.source_call,
+            self.dest_call
+        );
         Ok(())
     }
 
@@ -277,9 +310,9 @@ impl<'a> Session<'a> {
                 }
                 _ = stats.tick() => {
                     let (jb, underruns, depth) = sink.stats();
-                    tracing::info!(
-                        "统计: 缓冲 {depth} 帧 / 迟到 {} / 抖动欠载 {} / 溢出 {} / 漂移丢帧 {} / 输出欠载 {underruns}",
-                        jb.late, jb.underruns, jb.overflows, jb.skew_drops,
+                    tracing::debug!(
+                        "统计: 缓冲 {depth} 帧 / 迟到 {} / 抖动欠载 {} / 溢出 {} / 漂移丢帧 {} / 输出欠载 {underruns} / 峰值 RMS {:.0}",
+                        jb.late, jb.underruns, jb.overflows, jb.skew_drops, sink.peak_rms(),
                     );
                 }
                 _ = &mut sigint => {
@@ -308,7 +341,9 @@ impl<'a> Session<'a> {
                     return Ok(None);
                 }
                 let ts = self.clock.extend(m.timestamp);
-                sink.push_frame(ts, m.payload);
+                if let Some(ev) = sink.push_frame(ts, m.payload) {
+                    log_activity(ev, &mut self.activity_start);
+                }
                 Ok(None)
             }
             Frame::Full(f) => self.handle_full(f, sink).await,
@@ -317,7 +352,11 @@ impl<'a> Session<'a> {
 
     async fn handle_full(&mut self, f: FullFrame, sink: &mut AudioSink) -> Result<Option<CallEnd>> {
         if f.dest_call != self.source_call {
-            tracing::warn!("full frame 发给了呼叫号 {}，不是我们的 {}", f.dest_call, self.source_call);
+            tracing::warn!(
+                "full frame 发给了呼叫号 {}，不是我们的 {}",
+                f.dest_call,
+                self.source_call
+            );
             return Ok(None);
         }
         tracing::debug!("← {}", describe(&f));
@@ -327,7 +366,11 @@ impl<'a> Session<'a> {
         if !(f.frame_type == frame_type::IAX && iax::no_seq_increment(f.subclass)) {
             // 序列号对不上说明是重复帧：补一个 ACK 就丢掉，别推进状态
             if f.oseqno != self.iseqno {
-                tracing::debug!("重复帧 oseqno={} (期望 {})，重发 ACK", f.oseqno, self.iseqno);
+                tracing::debug!(
+                    "重复帧 oseqno={} (期望 {})，重发 ACK",
+                    f.oseqno,
+                    self.iseqno
+                );
                 self.send_ack(f.timestamp).await?;
                 return Ok(None);
             }
@@ -338,20 +381,28 @@ impl<'a> Session<'a> {
             frame_type::IAX => match f.subclass {
                 // PING/POKE 的应答就是 PONG，PONG 本身再被对端 ACK
                 iax::PING | iax::POKE => {
-                    self.send_at(frame_type::IAX, iax::PONG, Ies::new(), f.timestamp).await?;
+                    self.send_at(frame_type::IAX, iax::PONG, Ies::new(), f.timestamp)
+                        .await?;
                 }
                 iax::LAGRQ => {
-                    self.send_at(frame_type::IAX, iax::LAGRP, Ies::new(), f.timestamp).await?;
+                    self.send_at(frame_type::IAX, iax::LAGRP, Ies::new(), f.timestamp)
+                        .await?;
                 }
                 iax::PONG | iax::LAGRP => self.send_ack(f.timestamp).await?,
                 iax::ACK => {}
                 iax::HANGUP => {
                     self.send_ack(f.timestamp).await?;
-                    return Ok(Some(CallEnd::Disconnected(format!("对端挂断: {}", cause_of(&f)))));
+                    return Ok(Some(CallEnd::Disconnected(format!(
+                        "对端挂断: {}",
+                        cause_of(&f)
+                    ))));
                 }
                 iax::REJECT => {
                     self.send_ack(f.timestamp).await?;
-                    return Ok(Some(CallEnd::Disconnected(format!("对端拒绝: {}", cause_of(&f)))));
+                    return Ok(Some(CallEnd::Disconnected(format!(
+                        "对端拒绝: {}",
+                        cause_of(&f)
+                    ))));
                 }
                 iax::INVAL => {
                     return Ok(Some(CallEnd::Disconnected("呼叫被对端作废 (INVAL)".into())));
@@ -386,7 +437,9 @@ impl<'a> Session<'a> {
                 } else {
                     // full voice frame 带完整时间戳，拿它给 mini frame 的时钟对表
                     self.clock.sync(f.timestamp);
-                    sink.push_frame(f.timestamp, f.payload);
+                    if let Some(ev) = sink.push_frame(f.timestamp, f.payload) {
+                        log_activity(ev, &mut self.activity_start);
+                    }
                 }
             }
             other => {
@@ -407,7 +460,9 @@ impl<'a> Session<'a> {
         let mut delay = RETRY_INITIAL;
         let mut sends_left = RETRY_ATTEMPTS;
 
-        self.transport.send(&frame.encode().context("编码失败")?).await?;
+        self.transport
+            .send(&frame.encode().context("编码失败")?)
+            .await?;
         tracing::debug!("→ {}", describe(&frame));
         sends_left -= 1;
 
@@ -428,11 +483,16 @@ impl<'a> Session<'a> {
                     frame.retransmit = true;
                     sends_left -= 1;
                     tracing::warn!("{} 超时，重传", describe(&frame));
-                    self.transport.send(&frame.encode().context("编码失败")?).await?;
+                    self.transport
+                        .send(&frame.encode().context("编码失败")?)
+                        .await?;
                     delay = (delay * 2).min(RETRY_MAX);
                 }
                 Err(_) => {
-                    return Err(SessionError::Retry(anyhow!("{} 没有等到应答", describe(&frame))));
+                    return Err(SessionError::Retry(anyhow!(
+                        "{} 没有等到应答",
+                        describe(&frame)
+                    )));
                 }
             }
         }
@@ -453,7 +513,10 @@ impl<'a> Session<'a> {
             match Frame::parse(&buf) {
                 Ok(Frame::Full(f)) if f.dest_call == self.source_call => return Ok(f),
                 Ok(Frame::Full(f)) => {
-                    tracing::warn!("收到发给呼叫号 {} 的 full frame，不是我们的，忽略", f.dest_call);
+                    tracing::warn!(
+                        "收到发给呼叫号 {} 的 full frame，不是我们的，忽略",
+                        f.dest_call
+                    );
                 }
                 Ok(_) => tracing::trace!("收到非 full frame，此阶段忽略"),
                 Err(e) => tracing::warn!("丢弃无法解析的包: {e:#}"),
@@ -490,12 +553,15 @@ impl<'a> Session<'a> {
     async fn send_at(&mut self, ft: u8, subclass: u32, ies: Ies, ts: u32) -> Result<()> {
         let frame = self.build_at(ft, subclass, ies, ts)?;
         tracing::debug!("→ {}", describe(&frame));
-        self.transport.send(&frame.encode().context("编码失败")?).await?;
+        self.transport
+            .send(&frame.encode().context("编码失败")?)
+            .await?;
         Ok(())
     }
 
     async fn send_ack(&mut self, ts: u32) -> Result<()> {
-        self.send_at(frame_type::IAX, iax::ACK, Ies::new(), ts).await
+        self.send_at(frame_type::IAX, iax::ACK, Ies::new(), ts)
+            .await
     }
 
     /// 尽力而为：发 HANGUP，给对端一点时间回 ACK，无论结果都退出。
@@ -504,7 +570,10 @@ impl<'a> Session<'a> {
         ies.push(Ie::string(ie_id::CAUSE, "User hangup"));
         ies.push(Ie::u8(ie_id::CAUSE_CODE, 16)); // ITU Q.850 normal clearing
 
-        if let Err(e) = self.send_at(frame_type::IAX, iax::HANGUP, ies, self.timestamp()).await {
+        if let Err(e) = self
+            .send_at(frame_type::IAX, iax::HANGUP, ies, self.timestamp())
+            .await
+        {
             tracing::warn!("发送 HANGUP 失败: {e}");
             return;
         }
@@ -529,24 +598,61 @@ fn new_ies(cfg: &Config, token: &[u8]) -> Ies {
     ies.push(Ie::string(ie_id::CALLING_NAME, &cfg.caller.callerid));
     ies.push(Ie::u32(ie_id::CAPABILITY, format::ULAW));
     ies.push(Ie::u32(ie_id::FORMAT, format::ULAW));
-    ies.push(Ie { id: ie_id::CALLTOKEN, data: token.to_vec() });
+    ies.push(Ie {
+        id: ie_id::CALLTOKEN,
+        data: token.to_vec(),
+    });
     ies
+}
+
+/// 打出上话的起止时间。
+///
+/// 时长用帧数换算（媒体时钟，精确），不用两个墙上时间相减 —— 后者会把网络抖动
+/// 和调度延迟算进去。
+pub fn log_activity(ev: Activity, start: &mut Option<DateTime<Local>>) {
+    const FMT: &str = "%H:%M:%S";
+    match ev {
+        Activity::Started => {
+            let now = Local::now();
+            *start = Some(now);
+            tracing::info!("▶ 上话开始  {}", now.format(FMT));
+        }
+        Activity::Ended { frames } => {
+            let 时长 = Activity::duration_secs(frames);
+            let end = Local::now();
+            match start.take() {
+                Some(s) => tracing::info!(
+                    "■ 上话结束  {} ... {}   持续 {:.1} 秒",
+                    s.format(FMT),
+                    end.format(FMT),
+                    时长
+                ),
+                None => tracing::info!("■ 上话结束  ... {}   持续 {:.1} 秒", end.format(FMT), 时长),
+            }
+        }
+    }
 }
 
 fn md5_response(challenge: &str, secret: &str) -> String {
     let mut hasher = Md5::new();
     hasher.update(challenge.as_bytes());
     hasher.update(secret.as_bytes());
-    hasher.finalize().iter().fold(String::with_capacity(32), |mut s, b| {
-        use std::fmt::Write;
-        let _ = write!(s, "{b:02x}");
-        s
-    })
+    hasher
+        .finalize()
+        .iter()
+        .fold(String::with_capacity(32), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 /// 呼叫号是 15 位非 0。每次重连换一个，免得和服务端残留的旧呼叫状态撞上。
 fn random_call_number() -> u16 {
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(1);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(1);
     (nanos % 0x7fff) as u16 + 1
 }
 
@@ -665,21 +771,27 @@ mod tests {
     fn md5_应答格式() {
         let r = md5_response("123456", "test-secret");
         assert_eq!(r.len(), 32);
-        assert!(r.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            r.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
         // 参照值来自 `printf '123456test-secret' | md5`
         assert_eq!(r, "ffb1fa75bbd4f07c4ef9c9ce291ff45a");
     }
 
     #[test]
     fn md5_不同挑战给不同应答() {
-        assert_ne!(md5_response("aaa", "test-secret"), md5_response("bbb", "test-secret"));
+        assert_ne!(
+            md5_response("aaa", "test-secret"),
+            md5_response("bbb", "test-secret")
+        );
     }
 
     #[test]
     fn 呼叫号合法() {
         for _ in 0..100 {
             let n = random_call_number();
-            assert!(n >= 1 && n <= 0x7fff, "呼叫号 {n} 越界");
+            assert!((1..=0x7fff).contains(&n), "呼叫号 {n} 越界");
         }
     }
 
@@ -726,7 +838,11 @@ mod tests {
         c.extend(0xfff0); // 跨界乱序的旧帧
 
         // 后续正常帧必须仍在 0x0001 窗口，不能跳到 0x0002
-        assert_eq!(c.extend(0x0010), 0x0001_0010, "基准被乱序帧拖回，导致高位误进位");
+        assert_eq!(
+            c.extend(0x0010),
+            0x0001_0010,
+            "基准被乱序帧拖回，导致高位误进位"
+        );
         assert_eq!(c.extend(0x0030), 0x0001_0030);
         assert_eq!(c.extend(0x0050), 0x0001_0050);
     }

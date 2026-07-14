@@ -20,11 +20,15 @@ impl Transport {
             .next()
             .with_context(|| format!("{host} 没有解析到任何地址"))?;
 
-        let sock = UdpSocket::bind("0.0.0.0:0").await.context("绑定本地 UDP 端口失败")?;
+        let sock = UdpSocket::bind("0.0.0.0:0")
+            .await
+            .context("绑定本地 UDP 端口失败")?;
         // connect 之后内核只投递来自 peer 的包，省掉每次收包的来源校验
-        sock.connect(peer).await.with_context(|| format!("连接 {peer} 失败"))?;
+        sock.connect(peer)
+            .await
+            .with_context(|| format!("连接 {peer} 失败"))?;
 
-        tracing::info!("UDP 已就绪: {} -> {}", sock.local_addr()?, peer);
+        tracing::debug!("UDP 已就绪: {} -> {}", sock.local_addr()?, peer);
         Ok(Self { sock, peer })
     }
 
@@ -53,8 +57,9 @@ impl Transport {
 /// 逐字节十六进制，配合 Wireshark 对着看
 fn hex(buf: &[u8]) -> String {
     use std::fmt::Write;
-    buf.iter().fold(String::with_capacity(buf.len() * 3), |mut s, b| {
-        let _ = write!(s, "{b:02x} ");
-        s
-    })
+    buf.iter()
+        .fold(String::with_capacity(buf.len() * 3), |mut s, b| {
+            let _ = write!(s, "{b:02x} ");
+            s
+        })
 }

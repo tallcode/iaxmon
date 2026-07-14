@@ -1,8 +1,11 @@
+pub mod activity;
 pub mod jitter;
 pub mod player;
 pub mod resample;
 pub mod ulaw;
 
+use crate::config::ActivityCfg;
+use activity::{Activity, ActivityDetector};
 use anyhow::Result;
 use jitter::JitterBuffer;
 use player::Player;
@@ -28,10 +31,11 @@ pub struct AudioSink {
     pcm: Vec<i16>,
     out: Vec<f32>,
     target: usize,
+    detector: ActivityDetector,
 }
 
 impl AudioSink {
-    pub fn new() -> Result<Self> {
+    pub fn new(cfg: &ActivityCfg) -> Result<Self> {
         let player = Player::new()?;
         let resampler = Resampler::new(VOICE_SAMPLE_RATE, player.sample_rate());
         let target = player.sample_rate() as usize * OUTPUT_TARGET_MS / 1000;
@@ -42,16 +46,29 @@ impl AudioSink {
             pcm: Vec::with_capacity(SAMPLES_PER_FRAME),
             out: Vec::with_capacity(SAMPLES_PER_FRAME * 8),
             target,
+            detector: ActivityDetector::new(cfg.threshold, cfg.hang_ms),
         })
     }
 
-    pub fn push_frame(&mut self, timestamp: u32, ulaw_payload: Vec<u8>) {
+    /// 收到一帧语音。返回上话状态的变化（无变化则 None）。
+    ///
+    /// 检测放在这里而不是 `tick()`：这里反映的是**服务端实际发了什么**，而 `tick()`
+    /// 在抖动缓冲之后，网络丢帧造成的空洞会被误判成静音。
+    pub fn push_frame(&mut self, timestamp: u32, ulaw_payload: Vec<u8>) -> Option<Activity> {
+        let ev = self.detector.push(activity::frame_rms(&ulaw_payload));
         self.jitter.push(timestamp, ulaw_payload);
+        ev
     }
 
     /// 每次新呼叫开始前调。输出流保持不动，只清掉跟旧呼叫时间戳绑定的状态。
-    pub fn reset(&mut self) {
+    /// 若断线时正在上话，返回一个收尾事件。
+    pub fn reset(&mut self) -> Option<Activity> {
         self.jitter.reset();
+        self.detector.reset()
+    }
+
+    pub fn peak_rms(&self) -> f32 {
+        self.detector.peak_rms
     }
 
     /// 每 20ms 调一次，把输出缓冲补到目标水位。
@@ -74,6 +91,10 @@ impl AudioSink {
     }
 
     pub fn stats(&self) -> (jitter::Stats, u64, usize) {
-        (self.jitter.stats, self.player.underruns(), self.jitter.len())
+        (
+            self.jitter.stats,
+            self.player.underruns(),
+            self.jitter.len(),
+        )
     }
 }

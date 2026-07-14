@@ -12,7 +12,10 @@ pub struct Ie {
 
 impl Ie {
     pub fn string(id: u8, s: &str) -> Self {
-        Self { id, data: s.as_bytes().to_vec() }
+        Self {
+            id,
+            data: s.as_bytes().to_vec(),
+        }
     }
 
     pub fn u8(id: u8, v: u8) -> Self {
@@ -20,11 +23,17 @@ impl Ie {
     }
 
     pub fn u16(id: u8, v: u16) -> Self {
-        Self { id, data: v.to_be_bytes().to_vec() }
+        Self {
+            id,
+            data: v.to_be_bytes().to_vec(),
+        }
     }
 
     pub fn u32(id: u8, v: u32) -> Self {
-        Self { id, data: v.to_be_bytes().to_vec() }
+        Self {
+            id,
+            data: v.to_be_bytes().to_vec(),
+        }
     }
 
     pub fn as_string(&self) -> String {
@@ -34,21 +43,33 @@ impl Ie {
     pub fn as_u8(&self) -> Result<u8> {
         match self.data.as_slice() {
             [v] => Ok(*v),
-            _ => bail!("IE 0x{:02x} 期望 1 字节，实际 {} 字节", self.id, self.data.len()),
+            _ => bail!(
+                "IE 0x{:02x} 期望 1 字节，实际 {} 字节",
+                self.id,
+                self.data.len()
+            ),
         }
     }
 
     pub fn as_u16(&self) -> Result<u16> {
         match self.data.as_slice() {
             [a, b] => Ok(u16::from_be_bytes([*a, *b])),
-            _ => bail!("IE 0x{:02x} 期望 2 字节，实际 {} 字节", self.id, self.data.len()),
+            _ => bail!(
+                "IE 0x{:02x} 期望 2 字节，实际 {} 字节",
+                self.id,
+                self.data.len()
+            ),
         }
     }
 
     pub fn as_u32(&self) -> Result<u32> {
         match self.data.as_slice() {
             [a, b, c, d] => Ok(u32::from_be_bytes([*a, *b, *c, *d])),
-            _ => bail!("IE 0x{:02x} 期望 4 字节，实际 {} 字节", self.id, self.data.len()),
+            _ => bail!(
+                "IE 0x{:02x} 期望 4 字节，实际 {} 字节",
+                self.id,
+                self.data.len()
+            ),
         }
     }
 }
@@ -94,9 +115,17 @@ impl Ies {
             let id = buf[0];
             let len = buf[1] as usize;
             if buf.len() < 2 + len {
-                bail!("IE 0x{:02x} 数据被截断: 声明 {} 字节，实际剩余 {}", id, len, buf.len() - 2);
+                bail!(
+                    "IE 0x{:02x} 数据被截断: 声明 {} 字节，实际剩余 {}",
+                    id,
+                    len,
+                    buf.len() - 2
+                );
             }
-            ies.push(Ie { id, data: buf[2..2 + len].to_vec() });
+            ies.push(Ie {
+                id,
+                data: buf[2..2 + len].to_vec(),
+            });
             buf = &buf[2 + len..];
         }
         Ok(Self(ies))
@@ -151,7 +180,10 @@ mod tests {
         assert_eq!(parsed, ies);
         assert_eq!(parsed.get(ie_id::VERSION).unwrap().as_u16().unwrap(), 2);
         assert_eq!(parsed.get(ie_id::USERNAME).unwrap().as_string(), "N0CALL");
-        assert_eq!(parsed.get(ie_id::CALLED_NUMBER).unwrap().as_string(), "1999");
+        assert_eq!(
+            parsed.get(ie_id::CALLED_NUMBER).unwrap().as_string(),
+            "1999"
+        );
         assert_eq!(parsed.get(ie_id::FORMAT).unwrap().as_u32().unwrap(), 4);
         assert!(parsed.get(ie_id::CHALLENGE).is_none());
     }

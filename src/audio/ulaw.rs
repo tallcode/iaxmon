@@ -23,7 +23,11 @@ const fn decode_one(byte: u8) -> i16 {
     let u = !byte;
     let t = (((u & QUANT_MASK) as i32) << 3) + BIAS;
     let t = t << ((u & SEG_MASK) >> SEG_SHIFT);
-    if u & SIGN_BIT != 0 { (BIAS - t) as i16 } else { (t - BIAS) as i16 }
+    if u & SIGN_BIT != 0 {
+        (BIAS - t) as i16
+    } else {
+        (t - BIAS) as i16
+    }
 }
 
 #[inline]

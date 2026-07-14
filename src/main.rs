@@ -21,25 +21,40 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 const STABLE_CALL: Duration = Duration::from_secs(30);
 
 #[derive(Parser)]
-#[command(name = "iaxmon", about = "IAX2 客户端 — 连接 AllStarLink 节点并播放音频")]
+#[command(
+    name = "iaxmon",
+    about = "IAX2 客户端 — 连接 AllStarLink 节点并播放音频"
+)]
 struct Cli {
     /// 配置文件路径
     #[arg(short, long, default_value = "config.toml")]
     config: PathBuf,
+
+    /// 输出协议细节、链路状态和周期统计。排查问题时用。
+    ///
+    /// 默认只打「谁在上话」这类真正关心的信息。RUST_LOG 环境变量优先于本开关。
+    #[arg(short, long)]
+    verbose: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    let default_filter = if cli.verbose {
+        "iaxmon=debug"
+    } else {
+        "iaxmon=info"
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "iaxmon=info".into()),
+                .unwrap_or_else(|_| default_filter.into()),
         )
         .init();
 
-    let cli = Cli::parse();
     let cfg = Config::load(&cli.config)?;
-    tracing::info!(
+    tracing::debug!(
         "{}:{} user={} node={}",
         cfg.server.host,
         cfg.server.port,
@@ -48,11 +63,14 @@ async fn main() -> Result<()> {
     );
 
     // 输出流开一次就一直开着，重连期间只是没样本进来，回调自己填静音
-    let mut sink = AudioSink::new()?;
+    let mut sink = AudioSink::new(&cfg.activity)?;
     let mut backoff = BACKOFF_INITIAL;
 
     loop {
-        sink.reset();
+        // 断线时若正在上话，补一条收尾记录，免得日志里只有开始没有结束
+        if let Some(ev) = sink.reset() {
+            session::log_activity(ev, &mut None);
+        }
         let started = Instant::now();
 
         match run_call(&cfg, &mut sink).await {

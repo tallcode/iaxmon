@@ -50,7 +50,11 @@ impl FullFrame {
 
         let mut out = Vec::with_capacity(FULL_HEADER_LEN + self.payload.len());
         out.extend_from_slice(&(self.source_call | FLAG_FULL).to_be_bytes());
-        let dest = if self.retransmit { self.dest_call | FLAG_RETRANS } else { self.dest_call };
+        let dest = if self.retransmit {
+            self.dest_call | FLAG_RETRANS
+        } else {
+            self.dest_call
+        };
         out.extend_from_slice(&dest.to_be_bytes());
         out.extend_from_slice(&self.timestamp.to_be_bytes());
         out.push(self.oseqno);
@@ -81,6 +85,8 @@ pub struct MiniFrame {
 }
 
 impl MiniFrame {
+    /// 本客户端只收不发，运行时用不到；保留是为了让编解码成对、可往返测试。
+    #[allow(dead_code)]
     pub fn encode(&self) -> Result<Vec<u8>> {
         if self.source_call == 0 || self.source_call > CALL_NUMBER_MASK {
             bail!("source call number 不合法: {}", self.source_call);
@@ -167,7 +173,11 @@ pub(super) fn uncompress_subclass(csub: u8) -> u32 {
     if csub == CSUB_MINUS_ONE {
         return SUBCLASS_MINUS_ONE;
     }
-    if csub & FLAG_SC_LOG != 0 { 1u32 << (csub & MAX_SHIFT) } else { csub as u32 }
+    if csub & FLAG_SC_LOG != 0 {
+        1u32 << (csub & MAX_SHIFT)
+    } else {
+        csub as u32
+    }
 }
 
 #[cfg(test)]
@@ -220,7 +230,9 @@ mod tests {
         f.retransmit = true;
         let bytes = f.encode().unwrap();
         assert_eq!(&bytes[2..4], &[0xd6, 0x78]); // R 位置位，dest 不变
-        let Frame::Full(back) = Frame::parse(&bytes).unwrap() else { panic!() };
+        let Frame::Full(back) = Frame::parse(&bytes).unwrap() else {
+            panic!()
+        };
         assert!(back.retransmit);
         assert_eq!(back.dest_call, 0x5678);
     }
@@ -238,7 +250,9 @@ mod tests {
         f.payload = payload;
 
         let bytes = f.encode().unwrap();
-        let Frame::Full(back) = Frame::parse(&bytes).unwrap() else { panic!() };
+        let Frame::Full(back) = Frame::parse(&bytes).unwrap() else {
+            panic!()
+        };
         assert_eq!(back.ies().unwrap(), ies);
     }
 
@@ -288,7 +302,11 @@ mod tests {
 
     #[test]
     fn mini_frame_线格式与往返() {
-        let f = MiniFrame { source_call: 0x1234, timestamp: 0xabcd, payload: vec![0x01, 0x02] };
+        let f = MiniFrame {
+            source_call: 0x1234,
+            timestamp: 0xabcd,
+            payload: vec![0x01, 0x02],
+        };
         let bytes = f.encode().unwrap();
         assert_eq!(bytes, vec![0x12, 0x34, 0xab, 0xcd, 0x01, 0x02]); // F=0
         assert_eq!(Frame::parse(&bytes).unwrap(), Frame::Mini(f));
@@ -320,7 +338,9 @@ mod tests {
     #[test]
     fn 空负载的_mini_帧合法() {
         let bytes = [0x12, 0x34, 0xab, 0xcd];
-        let Frame::Mini(f) = Frame::parse(&bytes).unwrap() else { panic!() };
+        let Frame::Mini(f) = Frame::parse(&bytes).unwrap() else {
+            panic!()
+        };
         assert!(f.payload.is_empty());
     }
 }

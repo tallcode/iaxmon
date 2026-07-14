@@ -24,8 +24,12 @@ pub struct Player {
 
 impl Player {
     pub fn new() -> Result<Self> {
-        let device = cpal::default_host().default_output_device().context("找不到默认输出设备")?;
-        let supported = device.default_output_config().context("读取默认输出配置失败")?;
+        let device = cpal::default_host()
+            .default_output_device()
+            .context("找不到默认输出设备")?;
+        let supported = device
+            .default_output_config()
+            .context("读取默认输出配置失败")?;
 
         let sample_format = supported.sample_format();
         let channels = supported.channels() as usize;
@@ -45,7 +49,12 @@ impl Player {
         }?;
         stream.play().context("启动输出流失败")?;
 
-        Ok(Self { _stream: stream, prod, underruns, sample_rate })
+        Ok(Self {
+            _stream: stream,
+            prod,
+            underruns,
+            sample_rate,
+        })
     }
 
     pub fn sample_rate(&self) -> u32 {
