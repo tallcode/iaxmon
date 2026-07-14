@@ -145,7 +145,7 @@ pub const SUBCLASS_MINUS_ONE: u32 = u32::MAX;
 const CSUB_MINUS_ONE: u8 = 0xff;
 
 /// 子类压缩：小于 0x80 的原样放；否则必须是 2 的幂，存 log2 并置 C 位。
-fn compress_subclass(subclass: u32) -> Result<u8> {
+pub(super) fn compress_subclass(subclass: u32) -> Result<u8> {
     if subclass == SUBCLASS_MINUS_ONE {
         return Ok(CSUB_MINUS_ONE);
     }
@@ -163,7 +163,7 @@ fn compress_subclass(subclass: u32) -> Result<u8> {
 }
 
 /// 子类解压：C 位置位则是 2^value，否则原样。0xff 是 -1 的特例，不是 1<<31。
-fn uncompress_subclass(csub: u8) -> u32 {
+pub(super) fn uncompress_subclass(csub: u8) -> u32 {
     if csub == CSUB_MINUS_ONE {
         return SUBCLASS_MINUS_ONE;
     }

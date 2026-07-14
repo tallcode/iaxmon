@@ -14,15 +14,15 @@ use tokio::time::{MissedTickBehavior, interval, timeout};
 
 /// 接听**之前**多久没包才算断线。
 ///
-/// 振铃期间服务端在放提示音，会完全静默 —— 实测这段静默是 9.99 秒，而这个阈值
-/// 原来设成 10 秒，余量只有 13 毫秒。LAGRQ 稍晚一点就会在接听前一刻自判断线，
-/// 然后重连→振铃→再超时，死循环，一帧音频都收不到。这里必须留足余量。
+/// ASL 的 dialplan 里有硬编码的 `Wait(10)`，振铃期间服务端完全静默约 10 秒。
+/// 阈值必须远大于它，否则会在接听前一刻自判断线，然后重连→振铃→再超时，
+/// 陷入死循环，一帧音频都收不到。见 PROTOCOL.md §9.2。
 const SILENCE_TIMEOUT_RINGING: Duration = Duration::from_secs(30);
 
 /// 接听**之后**多久没包才算断线。
 ///
-/// 接听后服务端按 50 帧/秒持续推音频（不管有没有人上话，见 §10），静默 5 秒
-/// 就是丢了 250 帧，链路铁定没了，不必等满 30 秒。
+/// 接听后服务端按 50 帧/秒持续推流，不管 RF 侧有没有人上话（PROTOCOL.md §9.4）。
+/// 静默 5 秒等于丢了 250 帧，链路铁定没了，不必等满 30 秒。
 const SILENCE_TIMEOUT_ANSWERED: Duration = Duration::from_secs(5);
 /// 握手帧的重传起点
 const RETRY_INITIAL: Duration = Duration::from_millis(500);
@@ -95,17 +95,16 @@ impl VoiceClock {
 
     /// 把 16 位低位补成 32 位完整时间戳。
     ///
-    /// 两个坑，都是踩过的：
+    /// 两条约束缺一不可，违反任何一条的后果都是**永久静音且无法自愈**（见下）：
     ///
-    /// 1. **向后回绕也要处理。** 早先只判了「低位变小很多 → 进位」。一个跨越回绕边界
-    ///    乱序到达的旧帧（真值在上一窗口）会被算高 65536ms。
-    /// 2. **基准只能在前进时推进。** 早先无条件更新，于是上面那个倒退的帧会把基准拖回
-    ///    旧窗口；紧接着的正常帧相对这个被拖回的基准又被误判成向前回绕，高位错误进位 ——
-    ///    而高位只增不减，此后永久偏高 65 秒。
+    /// 1. 回绕判断必须双向。跨越回绕边界乱序到达的旧帧，真值属于上一个窗口，
+    ///    只判「低位变小很多 → 进位」会把它算高 65536ms。
+    /// 2. 基准只能在时间戳前进时推进。倒退的帧若把基准拖回旧窗口，紧接着的正常帧
+    ///    就会相对这个基准被误判成向前回绕而错误进位；高位只增不减，此后永久偏移。
     ///
-    /// 后果不是杂音，是**永久静音且无法自愈**：约 65 秒后服务端发来 full voice frame，
-    /// `sync()` 把基准拉回真值，于是所有新帧都比抖动缓冲的播放位置落后 65 秒，被当成迟到
-    /// 帧全部丢弃。而包还在正常到达，静默超时不会触发，重连也不会启动。
+    /// 之所以是永久静音而非杂音：约 65 秒后服务端会发来 full voice frame，`sync()`
+    /// 把基准拉回真值，于是此后所有帧都比抖动缓冲的播放位置落后 65 秒，被当迟到帧全部
+    /// 丢弃；而包仍在正常到达，静默超时不触发，重连也不会启动。
     fn extend(&mut self, low: u16) -> u32 {
         // 先假设它和基准在同一个窗口
         let candidate = (self.last & 0xFFFF_0000) | low as u32;
@@ -157,25 +156,11 @@ impl<'a> Session<'a> {
         })
     }
 
-    /// 组装 NEW 的 IE。`token` 是服务端下发的呼叫令牌；第一次呼叫时传空切片，
-    /// 表示「我支持 CallToken，请给我一个」。
-    fn new_ies(&self, token: &[u8]) -> Ies {
-        let mut ies = Ies::new();
-        ies.push(Ie::u16(ie_id::VERSION, IAX_PROTO_VERSION));
-        ies.push(Ie::string(ie_id::USERNAME, &self.cfg.auth.username));
-        ies.push(Ie::string(ie_id::CALLED_NUMBER, &self.cfg.call.node));
-        ies.push(Ie::string(ie_id::CALLING_NAME, &self.cfg.caller.callerid));
-        ies.push(Ie::u32(ie_id::CAPABILITY, format::ULAW));
-        ies.push(Ie::u32(ie_id::FORMAT, format::ULAW));
-        ies.push(Ie { id: ie_id::CALLTOKEN, data: token.to_vec() });
-        ies
-    }
-
     /// NEW → (CALLTOKEN → NEW) → AUTHREQ → AUTHREP → ACCEPT
     pub async fn handshake(&mut self) -> Result<()> {
         tracing::info!("呼叫 {} @ {}", self.cfg.call.node, self.transport.peer());
 
-        let ies = self.new_ies(&[]);
+        let ies = new_ies(self.cfg, &[]);
         let reply = self.send_reliable(frame_type::IAX, iax::NEW, ies).await?;
 
         // 服务端要求呼叫令牌：拿它下发的 token 重发一次 NEW。
@@ -194,7 +179,7 @@ impl<'a> Session<'a> {
             self.oseqno = 0;
             self.iseqno = 0;
             self.dest_call = 0;
-            let ies = self.new_ies(&token);
+            let ies = new_ies(self.cfg, &token);
             self.send_reliable(frame_type::IAX, iax::NEW, ies).await?
         } else {
             reply
@@ -531,6 +516,23 @@ impl<'a> Session<'a> {
     }
 }
 
+/// 组装 NEW 帧的 IE。`token` 是服务端下发的呼叫令牌；首次呼叫传空切片，
+/// 表示「我支持 CallToken，请给我一个」。
+///
+/// 只发这七个，别的一概不发 —— 理由见 DESIGN.md §2.2。CALLING NAME 不能省，
+/// ASL 的 dialplan 在它为空时会直接挂断。
+fn new_ies(cfg: &Config, token: &[u8]) -> Ies {
+    let mut ies = Ies::new();
+    ies.push(Ie::u16(ie_id::VERSION, IAX_PROTO_VERSION));
+    ies.push(Ie::string(ie_id::USERNAME, &cfg.auth.username));
+    ies.push(Ie::string(ie_id::CALLED_NUMBER, &cfg.call.node));
+    ies.push(Ie::string(ie_id::CALLING_NAME, &cfg.caller.callerid));
+    ies.push(Ie::u32(ie_id::CAPABILITY, format::ULAW));
+    ies.push(Ie::u32(ie_id::FORMAT, format::ULAW));
+    ies.push(Ie { id: ie_id::CALLTOKEN, data: token.to_vec() });
+    ies
+}
+
 fn md5_response(challenge: &str, secret: &str) -> String {
     let mut hasher = Md5::new();
     hasher.update(challenge.as_bytes());
@@ -576,6 +578,86 @@ fn describe(f: &FullFrame) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn 样例配置() -> Config {
+        toml::from_str(
+            r#"
+            [server]
+            host = "node.example"
+            port = 4569
+            [auth]
+            username = "N0CALL"
+            secret = "test-secret"
+            [caller]
+            callerid = "N0CALL"
+            [call]
+            node = "1999"
+        "#,
+        )
+        .unwrap()
+    }
+
+    /// NEW 帧的 IE 组成是和服务端 dialplan 直接挂钩的契约，逐字节锁住。
+    ///
+    /// 尤其是 CALLING NAME：ASL 的 dialplan 在它为空时会直接挂断（PROTOCOL.md §9.2），
+    /// 少发它的后果是彻底连不上。
+    #[test]
+    fn new_帧的_ie_线格式() {
+        let mut buf = Vec::new();
+        new_ies(&样例配置(), &[]).encode(&mut buf).unwrap();
+
+        assert_eq!(
+            buf,
+            vec![
+                0x0b, 0x02, 0x00, 0x02, // VERSION = 2
+                0x06, 0x06, b'N', b'0', b'C', b'A', b'L', b'L', // USERNAME
+                0x01, 0x04, b'1', b'9', b'9', b'9', // CALLED NUMBER
+                0x04, 0x06, b'N', b'0', b'C', b'A', b'L', b'L', // CALLING NAME
+                0x08, 0x04, 0x00, 0x00, 0x00, 0x04, // CAPABILITY = ulaw
+                0x09, 0x04, 0x00, 0x00, 0x00, 0x04, // FORMAT = ulaw
+                0x36, 0x00, // CALLTOKEN，空 = 「请给我一个令牌」
+            ]
+        );
+    }
+
+    /// 多发的 IE 会带来意料之外的服务端行为，少发的会连不上。锁住集合本身。
+    #[test]
+    fn new_帧只发这七个_ie() {
+        let ies = new_ies(&样例配置(), &[]);
+        let ids: Vec<u8> = ies.0.iter().map(|ie| ie.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                ie_id::VERSION,
+                ie_id::USERNAME,
+                ie_id::CALLED_NUMBER,
+                ie_id::CALLING_NAME,
+                ie_id::CAPABILITY,
+                ie_id::FORMAT,
+                ie_id::CALLTOKEN,
+            ]
+        );
+        // 明确不发的：CALLING NUMBER 留空不发，CALLED CONTEXT 由服务端决定
+        assert!(ies.get(ie_id::CALLING_NUMBER).is_none());
+        assert!(ies.get(ie_id::CALLED_CONTEXT).is_none());
+    }
+
+    /// 拿到令牌后重发的 NEW，除 CALLTOKEN 外必须和首次完全一致。
+    #[test]
+    fn new_帧带令牌重发时其余_ie_不变() {
+        let cfg = 样例配置();
+        let 首次 = new_ies(&cfg, &[]);
+        let 重发 = new_ies(&cfg, b"1752499200?0123456789abcdef0123456789abcdef01234567");
+
+        assert_eq!(首次.0.len(), 重发.0.len());
+        for (a, b) in 首次.0.iter().zip(重发.0.iter()) {
+            assert_eq!(a.id, b.id);
+            if a.id != ie_id::CALLTOKEN {
+                assert_eq!(a.data, b.data, "IE 0x{:02x} 不该随令牌变化", a.id);
+            }
+        }
+        assert_eq!(重发.get(ie_id::CALLTOKEN).unwrap().data.len(), 51);
+    }
 
     /// RFC 5456 的 MD5 认证就是 md5(challenge || secret) 的小写十六进制。
     /// 测试用假密码 —— 真密码只存在于 config.toml，绝不进仓库。

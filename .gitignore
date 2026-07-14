@@ -4,7 +4,7 @@
 config.toml
 
 # 编辑器交换/备份文件 —— 它们是 config.toml 的镜像，同样含密码。
-# 血的教训：.gitignore 只挡了 config.toml，vim 的 .config.toml.swp 照样被提交了上去。
+# 只忽略 config.toml 是不够的。
 *.swp
 *.swo
 *.swn

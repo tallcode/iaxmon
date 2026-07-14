@@ -19,7 +19,12 @@
 
 任何上行内容都不做 —— 麦克风、发射、PTT、DTMF。此外还排除注册、视频、Trunk、加密、ulaw 之外的编解码、GUI。
 
-这是刻意的取舍，不是没做完。设计取舍和协议细节见 [DESIGN.md](DESIGN.md)。
+这是刻意的取舍，不是没做完。
+
+## 文档
+
+- **[PROTOCOL.md](PROTOCOL.md)** —— IAX2 协议细节：帧格式、子类压缩、IE 表、认证、CallToken、时间戳还原、序列号语义，以及 AllStarLink 侧的 dialplan 约束和 PTT 机制。与本实现无关，写给任何要做 IAX2 的人。
+- **[DESIGN.md](DESIGN.md)** —— 本客户端的设计：范围取舍、模块划分、会话层、音频链路。
 
 ## 快速开始
 
@@ -56,7 +61,7 @@ codec = "ulaw"
 
 > **`config.toml` 含密码，已被 `.gitignore` 排除，不要提交。**
 >
-> 编辑器的交换文件（`.config.toml.swp` 之类）是它的镜像，同样含密码，也已被忽略 —— 这是踩过坑之后加的规则。
+> 编辑器的交换文件（`.config.toml.swp` 之类）是它的镜像，同样含密码，也已被忽略。
 
 服务端 `iax.conf` 对应的配置大致长这样：
 

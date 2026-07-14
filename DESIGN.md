@@ -1,37 +1,102 @@
-# iaxmon — IAX2 接收端客户端 开发文档
+# iaxmon 设计文档
+
+IAX2 协议本身的细节见 [PROTOCOL.md](PROTOCOL.md)。本文只讲这个客户端的设计。
 
 ## 1. 目标与范围
 
-命令行 IAX2 客户端，连到 AllStarLink 节点，把节点下发的语音解码并从本机扬声器放出来。功能对标 DVSwitch Mobile 的**收听**部分。
+命令行 IAX2 客户端，连到 AllStarLink 节点，把下行语音解码后从扬声器放出来。功能对标 DVSwitch Mobile 的**收听**部分。
 
 ### 做什么
 
 - IAX2 协议客户端（RFC 5456），UDP
-- MD5 挑战认证
-- 以最普通的 IAX2 话机方式呼叫指定 node，维持链路
-- 接收 G.711 μ-law 语音帧，抖动缓冲，解码，播放
+- CallToken + MD5 挑战认证
+- 以普通 IAX2 话机方式呼叫指定 node，维持链路
+- 接收 G.711 μ-law 语音，抖动缓冲，解码，播放
 - 断线后指数退避自动重连
-- Ctrl-C 时正常挂断
+- Ctrl-C 正常挂断
 
 ### 不做什么
 
 任何上行内容一律排除 —— 麦克风采集、语音发送、PTT、**DTMF**（DTMF 也是发送）。此外还排除：
 
-- 注册（REGREQ/REGAUTH/REGACK），理由见 §4.1
+- 注册（REGREQ/REGAUTH/REGACK），理由见 §2.1
 - 视频、Trunk 模式、加密
-- ulaw 之外的编解码（服务端 `disallow=all` / `allow=ulaw`）
+- ulaw 之外的编解码
 - GUI
 
-## 2. 已知配置
+这是刻意的取舍，不是没做完。
 
-服务端 `iax.conf` 里的对端定义：
+> ⚠️ **「只收不发」有一个前提不在客户端手里**：若服务端 dialplan 用 `Rpt()` 的 `D` 模式，仅仅接入呼叫就会让中继发射机全程按下，我们一帧不发也一样。详见 [PROTOCOL.md §9.3](PROTOCOL.md)。ASL stock 配置用的是 `P` 模式，安全。换到新节点前值得确认。
+
+## 2. 协议层的取舍
+
+### 2.1 不做注册
+
+注册的作用是让服务端知道该往哪个 IP 呼叫我们。我们是主动呼出的一方，服务端靠 NEW 帧里的 USERNAME IE 匹配 peer 配置来认证，用不上注册。
+
+DVSwitch 会注册是因为它还要接受呼入。
+
+### 2.2 NEW 帧只带七个 IE
+
+| IE | 值 |
+|---|---|
+| VERSION | 2 |
+| USERNAME | 配置的用户名 |
+| CALLED NUMBER | 配置的节点号 |
+| CALLING NAME | 配置的 callerid |
+| CAPABILITY | 0x00000004 (ulaw) |
+| FORMAT | 0x00000004 (ulaw) |
+| CALLTOKEN | 空（首次）/ 服务端下发的令牌（重发）|
+
+不发的及理由：
+
+- **CALLED CONTEXT** —— 入口 context 由服务端的 peer 配置指定，客户端不需要也不应该自己指定。
+- **CALLING NUMBER** —— 配置里留空，留空的就不发（发一个空字符串 IE 比不发更糟）。ASL 的 `[iax-client]` dialplan 只把它塞进 `NODENUM` 打日志，不发无害。
+- **ADSICPE / DNID / LANGUAGE** 等 —— 与本用途无关。
+
+CALLING NAME 不能省：ASL 的 dialplan 在它为空时会直接挂断。见 [PROTOCOL.md §9.2](PROTOCOL.md)。
+
+### 2.3 只实现 MD5 认证
+
+服务端配置 `auth=md5`。AUTHREQ 里 AUTHMETHODS 不含 MD5 位时直接报错退出，不重连 —— 那是配置问题，重试无意义。
+
+### 2.4 只实现 ulaw
+
+服务端配置 `disallow=all` / `allow=ulaw`。CAPABILITY 和 FORMAT 都只填 ulaw；ACCEPT 里服务端选定的 FORMAT 若不是 ulaw，报错退出。
+
+### 2.5 只对握手帧做严格重传
+
+NEW 和 AUTHREP 用退避重传（500ms 起，翻倍，上限 10s，最多 4 次），握手阶段丢包必须恢复。
+
+握手之后我们的上行只剩 ACK / PONG / LAGRP 这类幂等帧，丢了对端会重发，不值得为它维护重传队列。
+
+### 2.6 media transfer 不实现
+
+服务端配置 `transfer=no`，不会发起媒体转移。收到 TXREQ 一类的帧由兜底分支 ACK 后忽略。
+
+## 3. 配置
+
+落在 `config.toml`，已被 `.gitignore` 排除；仓库里只有不含密码的 `config.example.toml`。
+
+| 项 | 说明 |
+|---|---|
+| `server.host` / `server.port` | 服务端地址。IAX2 默认端口 4569 |
+| `auth.username` | 对应服务端 iax.conf 的 section 名 |
+| `auth.secret` | MD5 认证用 |
+| `caller.callerid` | 作为 CALLING NAME 发出，不能为空 |
+| `call.node` | 呼叫的目标 extension |
+| `audio.codec` | 目前只支持 `ulaw` |
+
+凭据只存在于 `config.toml` 一处。文档里用占位符，测试里用假密码。
+
+服务端 `iax.conf` 对应的 peer 配置形如：
 
 ```
 [N0CALL]
 type=friend
 context=iax-client
 auth=md5
-secret=<略，见 config.toml>
+secret=<密码>
 host=dynamic
 disallow=all
 allow=ulaw
@@ -39,475 +104,152 @@ transfer=no
 qualify=yes
 ```
 
-客户端侧参数落在 `config.toml`。该文件已被 `.gitignore` 排除，仓库里只有不含密码的 `config.example.toml`。
-
-| 项 | 值 | 说明 |
-|---|---|---|
-| host | （见本机 config.toml） | |
-| port | （见本机 config.toml） | 本例用的是非标准端口，IAX2 默认是 4569 |
-| username | （见本机 config.toml） | 对应 iax.conf 的 section 名 |
-| secret | （见本机 config.toml，**绝不写进任何会提交的文件**） | MD5 认证用 |
-| callerid | （见本机 config.toml） | 作为 CALLING NAME |
-| node | （见本机 config.toml） | 呼叫的目标 extension |
-
-截图里的 Caller Number（Optional，留空）和 Phone mode 开关都**不进配置**，理由见 §4.2。
-
-这几条服务端配置对实现有直接影响：
-
-- `auth=md5` → 只实现 MD5 认证分支，明文和 RSA 不做。
-- `allow=ulaw` → CAPABILITY 和 FORMAT IE 都只填 `0x00000004`。
-- `transfer=no` → 服务端不会发起媒体转移，TXREQ 那一套不实现，收到就忽略。
-- `host=dynamic` → 服务端不知道我们的 IP，无法主动呼入，只能我们呼出。这也是不需要注册的前提。
-- `qualify=yes` → **这条当初的推理是错的，保留在此以儆效尤。** 我从配置项名字推想出「服务端会周期性发 POKE，我们必须回 PONG，否则被判定为不可达」，从未验证。实测中保活帧**只出现过 LAGRQ，一次 POKE 都没有** —— 那个 LAGRQ 来自 chan_iax2 的每呼叫调度器，和 `qualify` 无关。而且 `qualify` 探测的是「服务端能否呼到我们」，对一个从不注册的 `host=dynamic` peer（见 §4.1），服务端根本没有我们的地址可探。POKE 的处理代码因此是死代码，见 §4.4。
-
-## 3. 依赖
-
-已在 `Cargo.toml` 里：
+## 4. 依赖
 
 | crate | 用途 |
 |---|---|
 | tokio | UDP socket、定时器、任务 |
 | cpal | 跨平台音频输出 |
+| ringbuf | 无锁 SPSC 环形缓冲，网络任务 → 音频回调 |
 | md-5 | 认证摘要 |
 | serde + toml | 配置 |
 | clap | 命令行参数 |
 | anyhow | 错误处理 |
 | tracing + tracing-subscriber | 日志 |
 
-还需补一个：**ringbuf**（无锁 SPSC 环形缓冲），用于把样本从网络任务递给音频回调。音频回调里不能加锁、不能分配内存，所以不能用 `Mutex<VecDeque>`。
+音频回调里不能加锁、不能分配内存，所以样本必须走无锁环形缓冲，不能用 `Mutex<VecDeque>`。
 
-## 4. 协议要点
-
-### 4.1 不做注册
-
-`host=dynamic` 的注册作用是让 Asterisk 知道该往哪个 IP 呼叫我们；而我们是主动呼出的一方，Asterisk 靠 NEW 帧里的 USERNAME IE 匹配到 `[N0CALL]` 这条配置来认证。DVSwitch 会注册是因为它还想接受呼入。我们只收听、只呼出，所以跳过。
-
-### 4.2 只发必要的 IE
-
-NEW 帧只带这六个 IE，别的一概不发：
-
-| IE | 值 |
-|---|---|
-| VERSION | 2 |
-| USERNAME | N0CALL |
-| CALLED NUMBER | 1999 |
-| CALLING NAME | N0CALL |
-| CAPABILITY | 0x00000004 (ulaw) |
-| FORMAT | 0x00000004 (ulaw) |
-
-**CALLING NAME 不是可选的，是承重的。** ASL 的 stock dialplan（`app_rpt/configs/rpt/extensions.conf`）里有这么一句：
+## 5. 模块划分
 
 ```
-same => n,Set(CALLSIGN=${CALLERID(name)})
-same => n,GotoIf(${ISNULL(${CALLSIGN})}?hangit)
-...
-same => n(hangit),NoOp(No Caller ID Name)
-same => n,Playback(connection-failed)
-same => n,Hangup
+src/
+  main.rs        入口、参数、组装、Ctrl-C、重连循环
+  config.rs      配置
+  proto/
+    consts.rs    帧类型、子类、IE 类型、位掩码
+    frame.rs     Full/Mini frame 编解码，子类压缩
+    ie.rs        IE 编解码
+  session.rs     呼叫状态机、序列号、ACK、保活、时间戳还原
+  transport.rs   UDP 收发
+  audio/
+    ulaw.rs      μ-law 解码表
+    jitter.rs    抖动缓冲
+    resample.rs  8k → 设备采样率
+    player.rs    cpal 输出流
+    mod.rs       AudioSink，把上面四个串成一条链路
 ```
 
-不发 CALLING NAME → `CALLSIGN` 为空 → 直接跳到 `hangit`，放一句 "connection failed" 就挂断。当初我们发它只是因为截图里填了 CallerID，理由是「配置里有就发」；现在知道了：不发根本连不上。
+`proto/` 不依赖会话层以上的任何东西，纯粹是协议编解码，可独立测试。
 
-外加一个 CALLTOKEN（见 §4.2.1）。不发的及原因：
+## 6. 会话层
 
-- **CALLED CONTEXT** —— 服务端 `context=iax-client` 是 Asterisk 侧给这个 user 指定的入口 context，由服务端自己决定，客户端不需要也不应该自己指定。
-- **CALLING NUMBER** —— 留空的就不发（发一个空字符串 IE 比不发更糟）。ASL 的 `[iax-client]` dialplan 只把它塞进 `NODENUM` 打条日志，不发无害。（注意 `[iaxrpt]` 那条路径不同：`iaxrpt-users.conf` 警告主叫号码必须是 `<0>`，非 0 会出怪事。我们走的是 `[iax-client]`，不受影响。）
-- **ADSICPE / DNID / LANGUAGE** 等 —— 可选，与我们的用途无关。
-- **phone_mode** —— 不是 IE，是 DVSwitch 的 UI 开关。我们按最普通的 IAX2 话机方式呼叫，CALLED NUMBER 直接填节点号，这个开关就没有对应物了，配置里也不保留。
+### 6.1 错误分类
 
-### 4.2.1 CallToken —— 不做不行
+`SessionError` 分两类，决定重连与否：
 
-这个服务端开了 `requirecalltoken`，不带呼叫令牌的 NEW 会被直接拒掉。**这是实测发现的，不是从配置推出来的**：第一版实现连不上，服务端回了一个空的 REJECT —— 没有任何 IE，源呼叫号写死是 `1`。那正是 Asterisk `send_apathetic_reply()` 的签名（它在建立呼叫状态之前就把包打发走了），而触发这条路径的就是 CallToken 检查。DVSwitch 能连上，正是因为它走了这套握手。
+- **`Fatal`** —— 配置或凭据问题，重试多少次都一样。认证被拒、服务端不支持 MD5、选定编码不是 ulaw。直接退出。
+- **`Retry`** —— 网络或对端状态问题。默认归类：`From<anyhow::Error>` 落到 `Retry`，致命错误必须显式构造，免得漏判导致无限重试。
 
-令牌是防 IP 伪造反射攻击的：服务端把「时间戳 + 基于来源 IP 的哈希」交给客户端，客户端原样带回来，服务端就能确认这个源 IP 是真的。流程是：
+### 6.2 断线检测
 
-1. 客户端发 NEW，带一个**长度为 0** 的 CALLTOKEN IE，意思是「我支持 CallToken，请给我一个」
-2. 服务端回 IAX/CALLTOKEN (子类 0x28)，里面的 CALLTOKEN IE 装着令牌（本服务端实测 51 字节）
-3. 客户端带着这个令牌**重发** NEW，其余 IE 不变
-4. 服务端这才正常走 AUTHREQ
-
-第 2 步的应答同样是 `send_apathetic_reply()` 发的，**源呼叫号是写死的 1，不是真正的呼叫号**。所以拿到令牌后整个呼叫状态要推倒重来（序列号归零、对端呼叫号清空），只留令牌，绝不能把 `1` 当成对端的呼叫号采纳下来。
-
-**事后用 AllStarLink 源码印证**（`~/AllStarLink`）：
-
-- ASL3 手册 `docs/config/iax_conf.md:158` 明确写着：「With ASL3 moving to Asterisk 20+, IAX2 now requires IAX2 Call Tokens, which some client software may not support, causing their calls to be rejected. You may need to add `requirecalltoken = no` to the affected context in `iax.conf` to resolve this.」
-- ASL 的 stock 模板 `app_rpt/configs/rpt/iax.conf:121` 在 `[iaxclient]` 段里**显式设置 `requirecalltoken = no`**，注释说是为了迁就老客户端。
-- 而本服务端的 peer 配置里**没有这一行**，于是走 Asterisk 的默认值（要求令牌）—— 这就是我们第一版被空 REJECT 打回的原因。
-
-也就是说：ASL 官方给的解法是「在服务端关掉 CallToken」，等于削弱安全性去迁就客户端。我们选择实现它，严格更优 —— 不用改服务端配置，也不用降低安全等级，而且对 `requirecalltoken=no` 的服务端同样兼容（Asterisk 只要看到客户端发了空 CALLTOKEN IE 就会下发令牌，不管该项配置如何）。
-
-### 4.3 帧格式
-
-**Full Frame，12 字节头**，之后跟 IE 或负载：
-
-```
- 0                   1                   2                   3
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|1|     Source Call Number      |R|   Destination Call Number   |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                            timestamp                          |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|   OSeqno      |    ISeqno     |  Frame Type   |C|  Subclass   |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-```
-
-- 最高位 F=1 表示 full frame
-- R = 重传标志
-- 呼叫号 15 位，非 0，我们随机取 1..=32767
-- timestamp = 呼叫开始至今的毫秒数
-- C=1 时实际 subclass = `1 << Subclass`（这样 7 位能表达大数值）。
-
-关于 C 位有个坑：**小于 0x80 的子类原样传，C=0；只有 ≥0x80 的才压缩成 log2 并置 C=1**，而且此时必须是 2 的幂，否则 Asterisk 直接拒绝。ulaw = 0x04 < 0x80，所以语音帧是 **C=0、subclass 字节 = 0x04**，而不是 C=1、Subclass=2。解压时 log2 值要和 `0x1f` 相与。（本文档早先版本这里写错了，已按 Asterisk `compress_subclass()` 的实际行为更正。）
-
-**Mini Frame，4 字节头**，只用于语音：
-
-```
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|0|     Source Call Number      |          timestamp            |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-```
-
-时间戳只有 16 位（完整时间戳的低 16 位），编码格式沿用**最近一个 full voice frame** 的格式。Mini frame 不需要 ACK。
-
-F=0 且 Source Call Number=0 的是 Meta 帧（trunk/video），不支持，直接丢弃。
-
-### 4.4 用到的帧类型和子类
-
-Frame Type：`0x02` VOICE、`0x04` CONTROL、`0x06` IAX。
-
-IAX 子类（Frame Type=0x06）：
-
-| 值 | 名字 | 我们的处理 |
-|---|---|---|
-| 0x01 | NEW | 发出 |
-| 0x02 | PING | 收到 → 回 PONG |
-| 0x03 | PONG | 收到 → 回 ACK |
-| 0x04 | ACK | 收发 |
-| 0x05 | HANGUP | 收发 |
-| 0x06 | REJECT | 收到 → 回 ACK，报错，转入重连 |
-| 0x07 | ACCEPT | 收到 → 回 ACK |
-| 0x08 | AUTHREQ | 收到 → 回 AUTHREP |
-| 0x09 | AUTHREP | 发出 |
-| 0x0a | INVAL | 收到 → 呼叫作废，转入重连 |
-| 0x0b | LAGRQ | 收到 → 回 LAGRP |
-| 0x0c | LAGRP | 收到 → 回 ACK |
-| 0x1e | POKE | 有处理代码，但**实际收不到**，见下 |
-| 0x28 | CALLTOKEN | 收到 → 带令牌重发 NEW，见 §4.2.1 |
-
-**POKE 的处理是死代码。** POKE 是 peer 级别的探测，不属于任何一通呼叫，带的是 `dcallno=0`；而我们在分发之前就有一道 `f.dest_call != self.source_call → 丢弃` 的过滤，POKE 走不到处理分支。就算走到了，回的 PONG 也会发给 `self.dest_call`，即错误的呼叫。留着无害（防御性），但别以为它在工作。
-
-CONTROL 子类（Frame Type=0x04）关心的：`0x01` HANGUP、`0x03` RINGING、`0x04` ANSWER、`0x05` BUSY、`0x08` CONGESTION。全部需要 ACK。
-
-### 4.5 Information Element
-
-格式是 `type(1) | len(1) | data(len)`，紧跟在 full frame 头后面，可以有多个。只列我们会收发的：
-
-| 值 | 名字 | 类型 | 方向 |
-|---|---|---|---|
-| 0x01 | CALLED NUMBER | 字符串 | 发 |
-| 0x04 | CALLING NAME | 字符串 | 发 |
-| 0x06 | USERNAME | 字符串 | 发 |
-| 0x08 | CAPABILITY | u32 | 发 |
-| 0x09 | FORMAT | u32 | 收发 |
-| 0x0b | VERSION | u16，固定 2 | 发 |
-| 0x0e | AUTHMETHODS | u16 位掩码 | 收 |
-| 0x0f | CHALLENGE | 字符串 | 收 |
-| 0x10 | MD5 RESULT | 字符串 | 发 |
-| 0x16 | CAUSE | 字符串 | 收（诊断用）|
-| 0x2a | CAUSE CODE | u8 | 收发（诊断用）|
-| 0x36 | CALLTOKEN | 不透明字节 | 收发，见 §4.2.1 |
-
-解析时遇到不认识的 IE 按长度跳过，不报错。
-
-**CAUSE CODE 是 0x2a（十进制 42），不是 0x2f。** 这里原先写成 0x2f，而 0x2f 其实是 RR_LOSS（接收报告的丢包率，u32）。后果有两个：挂断时会给服务端发一个 1 字节的畸形 RR_LOSS；解析 REJECT/HANGUP 时永远找不到原因码，诊断信息静默丢失。是对照 AllStarLink 的 py-iax2 实现（其编号与 Asterisk `iax2.h` 一致）时发现的。
-
-AUTHMETHODS 位掩码：`0x0001` 明文、`0x0002` MD5、`0x0004` RSA。只接受含 MD5 的，否则报错退出（不重连 —— 配置问题重试也没用）。
-
-**本文档早先版本这里写错了**（写成 0x02/0x04/0x08，整体偏了一位），导致实现把服务端广播的 MD5 当成明文而拒绝认证。取值以 Asterisk 的 `IAX_AUTH_*` 为准：`PLAINTEXT=(1<<0), MD5=(1<<1), RSA=(1<<2)`。实测佐证：服务端 iax.conf 写的是 `auth=md5`，它在 AUTHREQ 里广播的 AUTHMETHODS 就是 `0x0002`。
-
-媒体格式位掩码（CAPABILITY / FORMAT）：ulaw = `0x00000004`。
-
-### 4.6 认证
-
-`MD5_RESULT = hex(md5(challenge_string || secret))`，小写十六进制，32 字符，当字符串塞进 IE。challenge 是服务端 AUTHREQ 里 CHALLENGE IE 的原始字符串（不含结尾 NUL），secret 取自 config.toml 的 `auth.secret`。
-
-### 4.7 呼叫流程
-
-下面是实测跑通的流程（`RUST_LOG=iaxmon=debug` 的日志逐帧对照过）：
-
-```
-客户端                                     服务端 (<你的节点>:<端口>)
-  |                                            |
-  |-- NEW (VERSION,USERNAME,CALLED NUMBER,     |
-  |        CALLING NAME,CAPABILITY,FORMAT,     |
-  |        CALLTOKEN=空) --------------------> |
-  |                                            |
-  |<------------- CALLTOKEN (令牌 51 字节)     |  §4.2.1，源呼叫号是假的 1
-  |                                            |
-  |-- NEW (同上，CALLTOKEN=令牌) ------------> |  序列号归零重来
-  |<------------- ACK                          |  只确认送达，不是应答
-  |<------------- AUTHREQ (AUTHMETHODS,        |
-  |                        CHALLENGE,USERNAME) |
-  |                                            |
-  |-- AUTHREP (MD5 RESULT) ------------------> |
-  |<------------- ACK                          |
-  |<------------- ACCEPT (FORMAT)              |
-  |-- ACK -----------------------------------> |
-  |                                            |
-  |<------------- CONTROL/RINGING              |
-  |-- ACK -----------------------------------> |
-  |                                            |   ← 这里静默约 10 秒
-  |<------------- CONTROL/ANSWER               |
-  |-- ACK -----------------------------------> |
-  |                                            |
-  |<========= VOICE full frame (ulaw) =========|  第一帧是 full，确定格式
-  |-- ACK -----------------------------------> |
-  |<========= mini frames ... =================|  之后都是 mini，不用 ACK
-  |                                            |
-  |<------------- LAGRQ                        |  周期性保活，实测只见过这个
-  |-- LAGRP ---------------------------------> |
-  |                                            |
-  |-- HANGUP (Ctrl-C) -----------------------> |
-  |<------------- ACK                          |
-```
-
-两个实测才发现的关键点：
-
-- **服务端会先回一个裸 ACK 确认收到握手帧，再单独发 AUTHREQ/ACCEPT。** ACK 只代表送达，不是应答 —— 收到它要停止重传，但继续等真正的回复。把 ACK 当成应答会让握手在第一步就断掉。
-- **RINGING 到 ANSWER 之间静默了约 10 秒**（服务端在放提示音），这期间一个语音帧都没有。SILENCE_TIMEOUT 必须留够余量，否则刚振铃就会被自己判成断线。
-
-### 4.8 可靠传输
-
-Full frame 需要 ACK，mini frame 不需要。
-
-- **OSeqno**：我们发出的 full frame 计数，从 0 开始，每发一个非重传的 full frame +1。
-- **ISeqno**：我们期望收到的下一个 full frame 的 OSeqno。收到符合期望的 full frame 后 +1。
-- ACK 要带上**被确认帧的 timestamp**，且 ACK 本身不消耗 OSeqno（ACK/INVAL/VNAK/TXCNT/TXACC 这几种不递增）。
-- **这条规则收发两侧都要执行 —— 收到的 ACK 同样不消耗 ISeqno。** 这是实测踩到的坑：服务端 ACK 里带的 OSeqno 是它「下一个要发的」，并没有被消耗掉。如果照常把 ISeqno 推进 1，紧接着到来的真帧（CONTROL/ANSWER）的 OSeqno 就会比我们的期望值小 1，被误判成重复帧丢弃 —— 表现是呼叫接通了却永远收不到 ANSWER。
-- 重传：未收到 ACK 时按退避重发（起步 500ms，翻倍，上限 10s，最多 4 次），重发时置 R 位。超时未果 → 判定链路断开，转入重连。
-- 收到重复的 full frame（OSeqno < 期望值）→ 重发一次 ACK 并丢弃。
-
-简化：只对 NEW 和 AUTHREP 做严格重传（握手阶段丢包必须恢复）。握手之后我们的上行只剩 ACK/PONG 这类幂等帧，丢了对端会重发，不值得为它维护重传队列。
-
-### 4.9 断线检测与重连
-
-判定断线的三个条件，任一命中即触发重连：
+三个条件任一命中即触发重连：
 
 - 握手帧重传耗尽
 - 收到 HANGUP / REJECT / INVAL
-- 长时间没收到任何来自服务端的包。**这个阈值分两段，不能用一个值**：
-  - **接听前 30 秒**。振铃期间服务端在放提示音，实测会完全静默 **9.99 秒**。最早的实现用了统一的 10 秒，余量只有 13 毫秒 —— LAGRQ 稍晚一点就会在接听前一刻自判断线，然后重连→振铃→再超时，死循环，一帧音频都收不到。这种 bug 不会表现为偶发杂音，而是彻底连不上。
-  - **接听后 5 秒**。接听后服务端按 50 帧/秒持续推流（见 §10），静默 5 秒等于丢了 250 帧，链路铁定没了，不必等满 30 秒。
+- 长时间没收到任何包 —— **阈值分两段**：
 
-重连用指数退避：1s → 2s → 4s → 8s → 16s → 30s 封顶，之后固定 30s 一直重试。每次重连是一次全新的呼叫（新的呼叫号、序列号归零、时间戳基准重置）。重连期间音频输出流保持打开，只是没有样本进来，回调填静音。
+| 阶段 | 阈值 | 理由 |
+|---|---|---|
+| 接听前 | 30 秒 | ASL 的 dialplan 里有硬编码的 `Wait(10)`，振铃期间完全静默约 10 秒。阈值必须远大于它，否则会在接听前一刻自判断线并陷入重连死循环 |
+| 接听后 | 5 秒 | 服务端按 50 帧/秒持续推流，静默 5 秒等于丢了 250 帧，链路铁定没了 |
 
-例外：认证被拒（服务端不支持 MD5、或 MD5 结果不对）属于配置错误，直接退出，不重连。
+见 [PROTOCOL.md §9.2 / §9.4](PROTOCOL.md)。
 
-### 4.10 Mini frame 时间戳还原 —— 必须双向回绕
+### 6.3 重连
 
-Mini frame 只带完整时间戳的低 16 位，要靠最近一个 full voice frame 补出高 16 位。窗口是 65536ms，约 65.5 秒回绕一次。
+指数退避 1s → 2s → 4s → 8s → 16s → 30s 封顶，之后固定 30s。
 
-做法照搬 Asterisk 的 `unwrap_timestamp()`：拿基准的高 16 位拼一个候选值，再看它相对基准的差值落在哪个窗口 —— 差值 < -32768 说明其实在下一个窗口，> 32768 说明在上一个窗口。
+每次重连是一次全新的呼叫：新的呼叫号、序列号归零、时间戳基准重置、重新协商 CallToken。
 
-**两个坑，都踩过，后果是永久静音：**
+退避**只在呼叫活过 30 秒后才归零**。否则「一连上就被踢」会退化成 1 秒一次的死循环重试。
 
-1. **只处理向前回绕不够，向后也要处理。** 第一版只判了「低位变小很多 → 高位 +1」。一个跨越回绕边界、乱序到达的旧帧（真值属于上一窗口）会被算高 65536ms。
-2. **基准只能在前进时推进。** 第一版无条件更新基准，于是上面那个倒退的帧会把基准拖回旧窗口；紧接着的**正常**帧相对这个被拖回的基准，又被误判成向前回绕 —— 高位错误进位。而高位只增不减，此后每一帧永久偏高 65 秒。
+重连期间音频输出流保持打开，回调自动填静音。
 
-具体触发路径（`high=N`，`last_low=0x0008`，刚过完回绕点）：
+**抖动缓冲必须在每次新呼叫前 `reset()`** —— 新呼叫的时间戳从 0 重新起算，不清掉旧的播放位置的话，新帧会全部被判为迟到帧丢弃，表现为重连后再也没声音。
 
-| 步骤 | 输入 | 第一版的行为 | 正确值 |
-|---|---|---|---|
-| 1 | 乱序旧帧 `low=0xFFF0` | `0xFFF0 < 0x0008` 为假 → 不进位 → 输出 `N<<16\|0xFFF0`，基准被拖到 `0xFFF0` | `(N-1)<<16\|0xFFF0` |
-| 2 | 正常帧 `low=0x0010` | `0x0010 < 0xFFF0` 且差 `0xFFE0 > 0x8000` → **误进位** → `high=N+1` | `N<<16\|0x0010` |
-
-**为什么是永久静音而不是杂音**：约 65 秒后服务端会发来一个 full voice frame，`sync()` 把基准拉回真值 —— 于是这一帧及此后所有帧的时间戳，都比抖动缓冲的播放位置**落后 65 秒**，全部被判为迟到帧丢弃。而 `last_played` 只增不减，`reset()` 只在新呼叫时调用，所以**无法自愈**。更糟的是包还在正常到达，`SILENCE_TIMEOUT_ANSWERED` 永远不触发，重连也不会启动 —— 程序看起来活得好好的，就是没声音。
-
-触发需要在回绕边界附近发生 UDP 乱序或重复，单次概率不高；但边界每 65.5 秒来一次，而这东西是设计来 7×24 挂着的。我们最长只跑过 75 秒（刚过一个边界），属于典型的「没测够时间所以没暴露」。
-
-单元测试 `时钟_跨界乱序的旧帧要向后回绕` 和 `时钟_跨界乱序不污染后续帧` 锁住这两个坑 —— 已验证它们在第一版实现上确实失败，失败值精确地高出 65536。
-
-## 5. 音频链路
+## 7. 音频链路
 
 μ-law 8kHz 单声道，20ms 一帧 = 160 字节 = 160 个采样。
-
-**解码**：μ-law → i16，标准 G.711 展开，用 256 项查找表，`const` 一次性生成。
-
-**重采样**：macOS 默认输出设备基本只给 48000Hz，8k → 48k 是 6 倍。第一版用线性插值。如果听感不行，再换 `rubato` 做带低通的正经重采样。
-
-**输出**：cpal 默认设备 + 默认配置，输出 f32（实测本机是 48000Hz / 2ch / f32）。音频回调从 ringbuf 消费；欠载时填 0 并累加一个原子计数器（回调里不能做 I/O，日志由外面定期打）。
-
-线程模型：
 
 ```
 tokio 任务 (UDP recv) ──► 解协议 ──► 抖动缓冲 ──► ulaw 解码 ──► 重采样 ──► ringbuf ──► cpal 回调 ──► 扬声器
                                     (20ms 定时器触发，按水位补)
 ```
 
-抖动缓冲的取帧由一个 20ms 的 tokio interval 驱动，而不是由音频回调驱动 —— 保持回调里只做「从 ringbuf 拷贝」这一件事。
+抖动缓冲的取帧由 20ms 的 tokio interval 驱动，不由音频回调驱动 —— 保持回调里只做「从 ringbuf 拷贝」这一件事。
 
-### 5.1 喂数据要看水位，不能看时钟
+### 7.1 喂数据看水位，不看时钟
 
 **补多少样本由 ringbuf 的当前水位决定，不由定时器触发的频率决定。** 每次 tick 就是一句「补到目标水位（60ms）为止」。
 
-第一版实现是按时钟喂的 —— 每 20ms 推一帧，理论上正好 50 帧/秒。实测 30 秒里累计了 19160 次输出欠载（约 0.4 秒的样本），而且持续增长。原因有两层：
+音频设备按自己的晶振精确消费，和 tokio 的定时器是两个独立时钟，永远对不齐。按时钟喂必然持续欠载或溢出；按水位喂则是设备消费多少就补多少，定时器早一点晚一点都会被水位吸收。
 
-1. `MissedTickBehavior::Delay` 让实际周期变成「20ms + 处理耗时」，稳定慢于 50Hz；
-2. 更根本的是，音频设备按自己的晶振精确消费，和 tokio 的定时器是**两个独立时钟**，永远对不齐。
+### 7.2 抖动缓冲
 
-按水位喂就没这个问题：设备消费掉多少，下次 tick 就补多少，自动跟上它的节奏；定时器早一点晚一点都会被水位吸收。改完之后欠载数停在启动瞬间的 2560（缓冲还没填起来时的正常现象），此后两个 30 秒窗口纹丝不动。
+固定延迟：按时间戳排进 `BTreeMap<u32, Vec<u8>>`，预热到 100ms 再开始出帧。
 
-### 5.2 抖动缓冲
+- 时间戳早于播放位置的**迟到帧**直接丢弃，不能插队。
+- 缺帧时插静音（不做丢包隐藏）。
+- 缓冲被抽干后重新预热，避免在空缓冲上持续单帧抖动。
+- **深度超过预热深度的 2 倍（200ms）就主动丢最旧的帧**。服务端发帧时钟和本机声卡晶振长期必然有偏差，偏一边是延迟越涨越大，偏另一边是持续欠载。丢一帧只是 20ms，语音里几乎听不出来，比让延迟无限增长好得多。
+- 硬上限 100 帧（2 秒），防止对端猛灌导致无限增长。
 
-必须有，否则网络抖动直接变成爆音。
+### 7.3 解码与重采样
 
-做**固定延迟**：按时间戳把语音帧排进 `BTreeMap<u32, Vec<u8>>`，预热到 100ms 再开始出帧，落后播放位置的迟到帧丢弃。缺帧时插入静音（先不做丢包隐藏）。
+μ-law → i16 用编译期生成的 256 项查找表。
 
-**时钟漂移要兜住。** 服务端按它的时钟发帧，声卡按自己的晶振消费，长期必然有偏差：偏一边是缓冲持续堆积、延迟越涨越大，偏另一边是持续欠载。所以缓冲深度超过预热深度的 2 倍（200ms）就主动丢最旧的帧追上。丢一帧只是 20ms，语音里几乎听不出来，比让延迟无限增长好得多。
+macOS 默认输出设备基本只给 48000Hz，8k → 48k 用线性插值，对语音够用（已由人耳确认）。
 
-（实测中缓冲深度在 30 秒里从 9 帧涨到 12 帧，但两个采样点判断不了是真漂移还是噪声，没有继续测。这个防护不依赖那个结论 —— 两个独立时钟长期对不齐是必然的，兜住就对了。）
+**位置用有理数表示**（整数部分 + 以 out_rate 为分母的分数），不用 f64 累加 —— 浮点累加会漂：8k→48k 本该每块出 960 个样本，误差让位置停在 159.99999999999997 而多挤出一个，长跑下来就是持续的时钟偏移。
 
-Mini frame 的 16 位时间戳要先还原成 32 位才能进抖动缓冲 —— 这件事比看上去难，见 §4.10。
+### 7.4 输出
 
-## 6. 模块划分
+cpal 默认设备 + 默认配置。回调里单声道展开到设备的所有声道；欠载时填 0 并累加一个原子计数器（回调里不能做 I/O，日志由外面定期打）。
 
-```
-src/
-  main.rs        入口、参数、组装、Ctrl-C、重连循环
-  config.rs      配置（已完成）
-  proto/
-    mod.rs
-    frame.rs     Full/Mini frame 的编解码
-    ie.rs        IE 编解码
-    consts.rs    帧类型、子类、IE 类型、格式位掩码
-  session.rs     呼叫状态机、序列号、ACK/重传、PING/PONG
-  transport.rs   UDP socket 收发
-  audio/
-    mod.rs
-    ulaw.rs      μ-law 解码表
-    jitter.rs    抖动缓冲
-    resample.rs  8k → 设备采样率
-    player.rs    cpal 输出流
-```
-
-## 7. 里程碑
+## 8. 状态
 
 | # | 内容 | 状态 |
 |---|---|---|
-| M0 | 工程骨架 + 配置加载 | ✅ `cargo run` 正确打印配置 |
+| M0 | 工程骨架 + 配置加载 | ✅ |
 | M1 | 帧/IE 编解码 | ✅ 单元测试覆盖线格式、往返、边界、错误路径 |
-| M2 | UDP + 握手 | ✅ 实测拿到 ACCEPT（额外做了 §4.2.1 的 CallToken）|
-| M3 | 会话层：序列号、ACK、保活、HANGUP | ✅ 实测 75 秒链路稳定，LAGRQ/LAGRP 正常 |
-| M4 | 收语音帧 + ulaw 解码 + 抖动缓冲 | ✅ 实测语音帧持续流入，迟到/溢出均为 0 |
-| M5 | cpal 播放 | ✅ 输出流跑通，稳态零欠载。**音质待人耳确认** |
-| M6 | 收尾：Ctrl-C 挂断、指数退避重连、漂移兜底 | ✅ 已实现，长时间稳定性待观察 |
+| M2 | UDP + 握手（含 CallToken）| ✅ 实测拿到 ACCEPT |
+| M3 | 会话层：序列号、ACK、保活、HANGUP | ✅ 实测链路稳定 |
+| M4 | 收语音帧 + ulaw 解码 + 抖动缓冲 | ✅ 迟到/溢出均为 0 |
+| M5 | cpal 播放 | ✅ 音质经人耳确认 |
+| M6 | Ctrl-C 挂断、指数退避重连、漂移兜底 | ✅ 重连经强制断线实测 |
 
-M1 全部离线；M2 起需要连服务器。
+## 9. 调试
 
-## 8. 调试手段
-
-- `RUST_LOG=iaxmon=debug cargo run` 看协议日志；每个收发的 full frame 打一行。
-- `sudo tcpdump -i any -n udp port <你的端口> -w iax.pcap`，Wireshark 有内置 IAX2 解析器，能直接看出我们的帧格式对不对。M2 阶段最有用的工具。
-- 服务端如果能上 Asterisk CLI：`iax2 set debug on` + `iax2 show channels`，能看到它对我们的帧的解读和拒绝原因。
-
-## 9. 已确认的决策
-
-| 决策 | 结论 |
-|---|---|
-| phone_mode | 忽略，按最普通的 IAX2 话机方式实现，配置项不保留 |
-| CALLED NUMBER = 节点号 | ✅ 实测可用，服务端正常接通 |
-| CALLED CONTEXT | 不发（多余）|
-| CALLING NUMBER | 不发（留空的不发）|
-| 端口 | 非标准端口，已确认无误 |
-| DTMF | 不做（DTMF 属于发送）|
-| 断线重连 | 做，指数退避 1s→30s 封顶；认证失败直接退出不重连 |
-| 注册 | 不做（只呼出，用不上）|
-| CallToken | **必须做**，这个服务端强制要求，见 §4.2.1 |
-
-## 10. 关于 PTT（已用 app_rpt 源码核实）
-
-IAX2 协议本身**没有 PTT 概念**。RFC 5456 里没有任何「按下发射键 / 松开」的信令 —— 它是电话协议，一通呼叫就是一条双向的连续音频流。PTT 语义完全在 AllStarLink 的 **app_rpt** 应用层。
-
-以下结论均已对照 `~/AllStarLink/app_rpt/apps/app_rpt.c` 核实，附行号。
-
-### 10.1 服务端持续推流 ✅
-
-出向的门控在 `app_rpt.c:4875-4895`，两个分支都会 `ast_write(l->chan, f)`。对一条从未按键的电话链路（`lastrx == 0`），无论 `altlink()` 取何值都必有一个分支命中；而其中的 newkey 条件对电话链路恒真（它们持有 `RADIO_KEY_ALLOWED`）。帧来自 `RPT_CONF` 混音桥，**出向路径上没有任何「RF 有没有人上话」的门控**。
-
-所以不管中继那边有没有人发射，服务端都持续推流，没人上话时推的是静音。这和我们实测到的现象一致（75 秒里抖动缓冲深度稳定、欠载不增长），也是 §4.9 里 SILENCE_TIMEOUT 能成立的前提。
-
-### 10.2 电话模式下靠什么按键 —— 不是音频帧
-
-**本文档早先版本猜测「app_rpt 靠电话侧有没有音频帧到达来决定开发射机，即帧级 VOX」。这个猜测是错的。**
-
-帧级按键这个机制确实存在（`app_rpt.c:4701-4703`）：
-
-```c
-if ((l->link_newkey == RADIO_KEY_NOT_ALLOWED) && (!l->lastrealrx)) {
-    rxkey_helper(myrpt, l);   /* l->lastrealrx = 1 */
-}
+```bash
+RUST_LOG=iaxmon=debug cargo run    # 每个收发的 full frame 打一行
+RUST_LOG=iaxmon=trace cargo run    # 连原始字节一起打
 ```
 
-但它只对 `RADIO_KEY_NOT_ALLOWED` 生效 —— 而电话连接被显式排除在外（`app_rpt.c:7208-7212`）：
-
-```c
-l->link_newkey = RADIO_KEY_ALLOWED;
-if ((phone_mode == RPT_PHONE_MODE_NONE) && ...) {
-    l->link_newkey = RADIO_KEY_NOT_ALLOWED;
-}
-```
-
-`phone_mode` 非 NONE（即 P/D/S）时保持 `RADIO_KEY_ALLOWED`，帧级按键永远不触发。**那条路径是节点间互联的协议，不是电话门户的协议。** 猜测描述了一个真实机制，只是挂错了连接类型。
-
-电话模式下真正的按键方式：
-
-| Rpt() 模式 | 按键触发条件 |
-|---|---|
-| **`P`** PHONE_CONTROL | **DTMF `*6`** → `cop,6`（源码注释：*Simulate COR being activated (phone only)*）→ `lastrealrx = 1`；`#` 松开。另外也接受 `AST_CONTROL_RADIO_KEY/_UNKEY` 控制帧 |
-| **`D`** DUMB_DUPLEX（无 `v`） | **整通呼叫全程保持按下** —— `if ((phone_mode == RPT_PHONE_MODE_DUMB_DUPLEX) && (!phone_vox)) l->lastrealrx = 1;`（`app_rpt.c:7258-7259`）|
-| **`S`** DUMB_SIMPLEX | DTMF：`*` 切换，`#` 松开 |
-| 任意模式 + `v`/`V` | 真正的能量 VOX（`dovox()`，带去抖）|
-
-### 10.3 「只收不发」有个前提：服务端 dialplan 必须是 P 模式 ⚠️
-
-这是本次核实中最要紧的一条。**如果节点的 dialplan 用的是 `D` 模式且没带 `v`，那么仅仅是接入这通呼叫，就会让中继的发射机全程处于按下状态** —— 我们一帧音频都不发也照样如此（`app_rpt.c:7258-7259`）。那等于持续占据信道。
-
-ASL 的 stock dialplan 用的是 `P`，安全：
+每 30 秒一行统计：
 
 ```
-same => n,Rpt(${EXTEN},P,${CALLSIGN}-P)      ; app_rpt/configs/rpt/extensions.conf
+统计: 缓冲 4 帧 / 迟到 0 / 抖动欠载 0 / 溢出 0 / 漂移丢帧 0 / 输出欠载 2048
 ```
 
-在 `P` 模式且不带 `v` 选项的前提下，一个不发 DTMF、不发 `AST_CONTROL_RADIO_KEY`、不发 `!NEWKEY1!` 的客户端**无论发多少语音帧都不可能按下发射机**（`lastrealrx` 恒为 0）。我们的客户端这三样都不发，所以是安全的。
+- **输出欠载**在启动瞬间会有一批（缓冲还没填起来），稳态下不应继续增长。持续涨说明喂数据跟不上设备消费。
+- **迟到 / 溢出**长期为 0 才正常。
+- **漂移丢帧**偶尔加一是正常的，持续快速增长说明时钟偏差异常大。
 
-但这个安全性**由服务端的 dialplan 保证，不由客户端保证**。换一台节点前值得确认它走的是 `P`。
+抓包见 [PROTOCOL.md §11](PROTOCOL.md)。
 
-### 10.4 一个必须避开的陷阱：别发 `!NEWKEY1!`
+## 10. 遗留
 
-app_rpt 的文本协议是 `!NEWKEY!` / `!NEWKEY1!`（`app_rpt.h:495-496`）。服务端对电话连接**从不发送**这两个（每个 `send_newkey()` 调用点都有 `phone_mode == RPT_PHONE_MODE_NONE` 的守卫）。
-
-但接收侧的 `handle_link_data` 是从 `AST_FRAME_TEXT` 分支进来的（`app_rpt.c:4788-4795`），**没有电话模式守卫**。也就是说，客户端只要发了 `!NEWKEY1!`，链路就会被翻成 `RADIO_KEY_NOT_ALLOWED`，后果有两个：帧级按键被启用（我们就能意外按下发射机了），以及出向音频变成以 `l->lasttx` 为条件（我们会听不到声音）。
-
-我们不发任何 TEXT 帧，天然避开。但这条值得记下来 —— 万一以后要加发射功能，这是个雷。
-
-（另外 `!IAXKEY!` 是 iaxrpt 的遗留消息，app_rpt 显式解析后**直接忽略**，见 `app_rpt.c:1931-1934`。）
-
-### 10.5 想知道「现在有没有人上话」——没有带内信号
-
-`app_rpt.c:4647` 处 `ast_indicate(AST_CONTROL_RADIO_KEY/_UNKEY)` 被 `phone_mode == RPT_PHONE_MODE_NONE` 守卫，**电话连接永远收不到 RADIO_KEY/UNKEY 控制帧**。
-
-这意味着：要做「上话活动指示」，只能自己算解码后音频的 RMS，没有协议层的现成信号可用。（另一条路是解析 `AST_FRAME_TEXT` 推来的链路状态字符串 —— 每 `linkpost_time` 秒推一次的 `"L "` 节点列表，`app_rpt.c:3465-3487` —— 但那是链路状态，不是发射活动。）
-
-### 10.6 未能确定的
-
-- `AST_CONTROL_RADIO_KEY` 的 IAX2 线格式子类值 —— 定义在 Asterisk 的 `frame.h`，本机没有该源码树。要用得从 Asterisk 源码取，不能从 app_rpt 推。
-- DVSwitch Mobile / iaxrpt 客户端**实际**发的是什么。源码只说明 app_rpt **接受**什么（DTMF `*6`/`#`、RADIO_KEY/UNKEY、能量 VOX），客户端行为不在这个仓库里。
-
-## 11. 遗留
-
-- **长时间稳定性待观察。** 最长只连续跑过 75 秒 —— 刚好跨过一个 mini frame 时间戳的回绕边界（65.536 秒）。§4.10 那个永久静音的 bug 正是「没跑够时间所以没暴露」的典型，修完之后同样需要长跑验证。
-- **丢包隐藏没做。** 缺帧时插的是静音。实测网络很干净（迟到 0、欠载 0），暂时不值得做。真到了丢包率高的网络上，可以改成重复上一帧并衰减。
-- **VNAK 收到后只回 ACK，不重传。** 且我们自己发现入向有缺口时，发的是 ACK 而不是 VNAK。都不危险：我们的 ACK 带的是未推进的 iseqno，不会谎称收到了没收到的帧，对端的重传定时器照样能补上；而握手之后我们的上行只有 ACK/PONG/LAGRP 这类幂等帧。属于「恢复得比理论上慢」，不是「恢复不了」。
-
-已消除的遗留：音质已由人耳确认正确（线性插值重采样够用，不需要换 rubato）；重连路径已通过强制断线实测，4 次重连均正常换新呼叫号、重新协商 CallToken、握手成功，退避严格按 1→2→4→8 秒走。
+- **长时间稳定性待观察。** 最长连续跑过 75 秒。mini frame 时间戳每 65.536 秒回绕一次，跨多个回绕边界的长跑尚未做过。
+- **丢包隐藏没做。** 缺帧时插静音。实测网络干净（迟到 0、欠载 0），暂不值得做。丢包率高的网络上可改成重复上一帧并衰减。
+- **VNAK 收到后只回 ACK，不重传**；自己发现入向有缺口时发的是 ACK 而非 VNAK。都不危险：我们的 ACK 带的是未推进的 ISeqno，不会谎称收到了没收到的帧，对端的重传定时器照样能补上；且握手后我们的上行只有幂等帧。属于恢复得比理论上慢，不是恢复不了。
+- **POKE 处理是死代码。** POKE 携带 `dcallno=0`，会被 `session.rs` 里的 `dest_call != source_call` 前置过滤丢弃，走不到处理分支。留着无害，但它不工作。见 [PROTOCOL.md §10](PROTOCOL.md)。
