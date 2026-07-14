@@ -104,6 +104,10 @@ sudo tcpdump -i any -n udp port 4569 -w iax.pcap
 
 **振铃后就断线重连，永远听不到声音** —— 静默超时设得比服务端提示音还短。见 DESIGN.md §4.9，接听前后用的是两个不同的阈值。
 
+## 作者
+
+BG5ATV
+
 ## 协议
 
 MIT，见 [LICENSE](LICENSE)。

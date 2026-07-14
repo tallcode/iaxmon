@@ -70,27 +70,60 @@ impl From<anyhow::Error> for SessionError {
 
 pub type Result<T> = std::result::Result<T, SessionError>;
 
+/// 半个 16 位窗口。候选值和基准差出这么多，就说明它其实在相邻的窗口里。
+const HALF_WINDOW: i32 = 0x8000;
+/// 一个完整的 16 位时间戳窗口 = 65536ms
+const WINDOW: u32 = 0x1_0000;
+
 /// Mini frame 只带 16 位时间戳，要靠最近的 full frame 补出高 16 位。
+///
+/// 做法照搬 Asterisk 的 `unwrap_timestamp()`：拿基准的高 16 位拼一个候选值，再看它
+/// 相对基准落在哪个窗口。**必须双向判断** —— 只处理向前回绕会出大事，见 `extend`。
 #[derive(Default)]
 struct VoiceClock {
-    high: u32,
-    last_low: u16,
+    /// 最近一次判定的完整时间戳，作为判断基准
+    last: u32,
 }
 
 impl VoiceClock {
     /// Full voice frame 带完整时间戳，直接对表。
+    ///
+    /// 乱序的旧 full frame 不会走到这里 —— 它在序列号检查那关就被当重复帧丢了。
     fn sync(&mut self, timestamp: u32) {
-        self.high = timestamp >> 16;
-        self.last_low = timestamp as u16;
+        self.last = timestamp;
     }
 
-    /// 低 16 位相比上次明显回绕（差值超过半个周期）就进位。
+    /// 把 16 位低位补成 32 位完整时间戳。
+    ///
+    /// 两个坑，都是踩过的：
+    ///
+    /// 1. **向后回绕也要处理。** 早先只判了「低位变小很多 → 进位」。一个跨越回绕边界
+    ///    乱序到达的旧帧（真值在上一窗口）会被算高 65536ms。
+    /// 2. **基准只能在前进时推进。** 早先无条件更新，于是上面那个倒退的帧会把基准拖回
+    ///    旧窗口；紧接着的正常帧相对这个被拖回的基准又被误判成向前回绕，高位错误进位 ——
+    ///    而高位只增不减，此后永久偏高 65 秒。
+    ///
+    /// 后果不是杂音，是**永久静音且无法自愈**：约 65 秒后服务端发来 full voice frame，
+    /// `sync()` 把基准拉回真值，于是所有新帧都比抖动缓冲的播放位置落后 65 秒，被当成迟到
+    /// 帧全部丢弃。而包还在正常到达，静默超时不会触发，重连也不会启动。
     fn extend(&mut self, low: u16) -> u32 {
-        if low < self.last_low && self.last_low - low > 0x8000 {
-            self.high = self.high.wrapping_add(1);
+        // 先假设它和基准在同一个窗口
+        let candidate = (self.last & 0xFFFF_0000) | low as u32;
+        // 再看差值把它修正到正确的窗口
+        let delta = candidate.wrapping_sub(self.last) as i32;
+        let ts = if delta < -HALF_WINDOW {
+            candidate.wrapping_add(WINDOW) // 其实在下一个窗口
+        } else if delta > HALF_WINDOW {
+            candidate.wrapping_sub(WINDOW) // 其实在上一个窗口
+        } else {
+            candidate
+        };
+
+        // 只有前进才推进基准。乱序到达的旧帧不能把基准拖回去。
+        if ts.wrapping_sub(self.last) as i32 > 0 {
+            self.last = ts;
         }
-        self.last_low = low;
-        (self.high << 16) | low as u32
+        ts
     }
 }
 
@@ -590,6 +623,55 @@ mod tests {
         c.sync(0x0001_0100);
         assert_eq!(c.extend(0x00f0), 0x0001_00f0); // 比上一个小，但差值远不到半周期
         assert_eq!(c.extend(0x0110), 0x0001_0110);
+    }
+
+    /// 跨越回绕边界乱序到达的旧帧，必须算回上一个窗口，不能算成当前窗口。
+    #[test]
+    fn 时钟_跨界乱序的旧帧要向后回绕() {
+        let mut c = VoiceClock::default();
+        c.sync(0x0001_0008); // 刚过完回绕点
+        // 真值是 0x0000_fff0（上一窗口，约 24ms 之前），不是 0x0001_fff0
+        assert_eq!(c.extend(0xfff0), 0x0000_fff0);
+    }
+
+    /// 这是那个会导致永久静音的组合：跨界乱序帧之后，基准不能被拖回旧窗口，
+    /// 否则下一个正常帧会被误判成向前回绕，高位错误进位且永不回退。
+    #[test]
+    fn 时钟_跨界乱序不污染后续帧() {
+        let mut c = VoiceClock::default();
+        c.sync(0x0001_0008);
+
+        c.extend(0xfff0); // 跨界乱序的旧帧
+
+        // 后续正常帧必须仍在 0x0001 窗口，不能跳到 0x0002
+        assert_eq!(c.extend(0x0010), 0x0001_0010, "基准被乱序帧拖回，导致高位误进位");
+        assert_eq!(c.extend(0x0030), 0x0001_0030);
+        assert_eq!(c.extend(0x0050), 0x0001_0050);
+    }
+
+    /// 重复帧（同一个低位反复到达）不应该推进任何东西
+    #[test]
+    fn 时钟_重复帧幂等() {
+        let mut c = VoiceClock::default();
+        c.sync(0x0001_0100);
+        assert_eq!(c.extend(0x0120), 0x0001_0120);
+        assert_eq!(c.extend(0x0120), 0x0001_0120);
+        assert_eq!(c.extend(0x0120), 0x0001_0120);
+        assert_eq!(c.extend(0x0140), 0x0001_0140);
+    }
+
+    /// 正常的 20ms 步进跑过多个回绕边界，不能有任何漂移
+    #[test]
+    fn 时钟_连续步进跨多个边界() {
+        let mut c = VoiceClock::default();
+        c.sync(0);
+        let mut expected: u32 = 0;
+        // 20ms 一帧，跑 10 分钟，跨越约 9 个回绕边界
+        for _ in 0..(50 * 600) {
+            expected = expected.wrapping_add(20);
+            assert_eq!(c.extend(expected as u16), expected, "在 {expected} 处漂移");
+        }
+        assert!(expected > 5 * 0x1_0000, "没跑够回绕边界，测试无效");
     }
 
     #[test]

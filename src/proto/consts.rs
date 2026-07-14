@@ -94,9 +94,14 @@ pub mod ie {
     pub const APPARENT_ADDR: u8 = 0x12;
     pub const REFRESH: u8 = 0x13;
     pub const CAUSE: u8 = 0x16;
+    /// Q.931 原因码，u8。
+    ///
+    /// 注意是 0x2a（十进制 42），不是 0x2f —— 0x2f 是 RR_LOSS（接收报告的丢包率，u32）。
+    /// 这里原先写成 0x2f，后果有两个：挂断时会给服务端发一个 1 字节的畸形 RR_LOSS；
+    /// 解析 REJECT/HANGUP 时永远找不到原因码，诊断信息静默丢失。
+    pub const CAUSE_CODE: u8 = 0x2a;
     /// 呼叫令牌，防 IP 伪造的反射攻击
     pub const CALLTOKEN: u8 = 0x36;
-    pub const CAUSE_CODE: u8 = 0x2f;
 }
 
 /// 认证方式位掩码。
