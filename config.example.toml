@@ -19,3 +19,19 @@ codec = "ulaw"
 [activity]
 threshold = 50.0   # RMS 阈值，超过即判定有人上话
 hang_ms = 500      # 静音多久判定上话结束
+
+# 只有使用 --nats 时才需要；servers 可填写同一集群的多个入口。
+[nats]
+servers = [
+  "nats://nats-1.internal:4222",
+  "nats://nats-2.internal:4222",
+  "nats://nats-3.internal:4222",
+]
+subject_prefix = "iaxmon.nodes.1999"
+
+# 可选认证方式一：用户名和密码必须同时配置。
+# username = "iaxmon"
+# password = "your-nats-password"
+
+# 可选认证方式二：token，不能和 username/password 同时配置。
+# token = "your-nats-token"

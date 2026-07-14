@@ -9,7 +9,7 @@ use crate::proto::consts::{
 use crate::proto::{Frame, FullFrame, Ie, Ies};
 use crate::transport::Transport;
 use anyhow::{Context, anyhow};
-use chrono::{DateTime, Local};
+use chrono::Local;
 use md5::{Digest, Md5};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::{MissedTickBehavior, interval, timeout};
@@ -140,8 +140,6 @@ pub struct Session<'a> {
     /// 收到 CONTROL/ANSWER 之后为 true。决定用哪个静默阈值 —— 振铃期和通话期
     /// 服务端的发包节奏完全不同，不能用同一把尺子量。
     answered: bool,
-    /// 本次上话的起始墙上时间，用于打出「起止」
-    activity_start: Option<DateTime<Local>>,
 }
 
 impl<'a> Session<'a> {
@@ -157,7 +155,6 @@ impl<'a> Session<'a> {
             start: Instant::now(),
             clock: VoiceClock::default(),
             answered: false,
-            activity_start: None,
         })
     }
 
@@ -342,7 +339,7 @@ impl<'a> Session<'a> {
                 }
                 let ts = self.clock.extend(m.timestamp);
                 if let Some(ev) = sink.push_frame(ts, m.payload) {
-                    log_activity(ev, &mut self.activity_start);
+                    log_activity(ev);
                 }
                 Ok(None)
             }
@@ -438,7 +435,7 @@ impl<'a> Session<'a> {
                     // full voice frame 带完整时间戳，拿它给 mini frame 的时钟对表
                     self.clock.sync(f.timestamp);
                     if let Some(ev) = sink.push_frame(f.timestamp, f.payload) {
-                        log_activity(ev, &mut self.activity_start);
+                        log_activity(ev);
                     }
                 }
             }
@@ -605,30 +602,21 @@ fn new_ies(cfg: &Config, token: &[u8]) -> Ies {
     ies
 }
 
-/// 打出上话的起止时间。
+/// 打出上话发生的时间和持续时长。
 ///
 /// 时长用帧数换算（媒体时钟，精确），不用两个墙上时间相减 —— 后者会把网络抖动
 /// 和调度延迟算进去。
-pub fn log_activity(ev: Activity, start: &mut Option<DateTime<Local>>) {
+pub fn log_activity(ev: Activity) {
     const FMT: &str = "%H:%M:%S";
     match ev {
         Activity::Started => {
             let now = Local::now();
-            *start = Some(now);
-            tracing::info!("▶ 上话开始  {}", now.format(FMT));
+            tracing::info!("▶ {}", now.format(FMT));
         }
         Activity::Ended { frames } => {
             let 时长 = Activity::duration_secs(frames);
             let end = Local::now();
-            match start.take() {
-                Some(s) => tracing::info!(
-                    "■ 上话结束  {} ... {}   持续 {:.1} 秒",
-                    s.format(FMT),
-                    end.format(FMT),
-                    时长
-                ),
-                None => tracing::info!("■ 上话结束  ... {}   持续 {:.1} 秒", end.format(FMT), 时长),
-            }
+            tracing::info!("■ {}   持续 {:.1} 秒", end.format(FMT), 时长);
         }
     }
 }

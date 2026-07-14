@@ -1,5 +1,6 @@
 mod audio;
 mod config;
+mod nats;
 mod proto;
 mod session;
 mod transport;
@@ -8,6 +9,7 @@ use anyhow::Result;
 use audio::AudioSink;
 use clap::Parser;
 use config::Config;
+use nats::NatsPublisher;
 use session::{CallEnd, Session, SessionError};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -35,6 +37,10 @@ struct Cli {
     /// 默认只打「谁在上话」这类真正关心的信息。RUST_LOG 环境变量优先于本开关。
     #[arg(short, long)]
     verbose: bool,
+
+    /// 把有声音频发布到 Core NATS；开启后不初始化或使用本机声卡。
+    #[arg(long)]
+    nats: bool,
 }
 
 #[tokio::main]
@@ -47,6 +53,9 @@ async fn main() -> Result<()> {
         "iaxmon=info"
     };
     tracing_subscriber::fmt()
+        .without_time()
+        .with_level(false)
+        .with_target(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| default_filter.into()),
@@ -62,20 +71,36 @@ async fn main() -> Result<()> {
         cfg.call.node
     );
 
-    // 输出流开一次就一直开着，重连期间只是没样本进来，回调自己填静音
-    let mut sink = AudioSink::new(&cfg.activity)?;
+    let nats = if cli.nats {
+        let nats_cfg = cfg.require_nats()?;
+        Some(NatsPublisher::connect(nats_cfg).await?)
+    } else {
+        None
+    };
+
+    // 两种模式互斥：NATS 模式完全不创建声卡输出流。
+    let mut sink = match &nats {
+        Some(publisher) => AudioSink::new_nats(&cfg.activity, publisher.clone()),
+        None => AudioSink::new(&cfg.activity)?,
+    };
     let mut backoff = BACKOFF_INITIAL;
 
     loop {
-        // 断线时若正在上话，补一条收尾记录，免得日志里只有开始没有结束
-        if let Some(ev) = sink.reset() {
-            session::log_activity(ev, &mut None);
-        }
         let started = Instant::now();
+        let result = run_call(&cfg, &mut sink, nats.as_ref()).await;
 
-        match run_call(&cfg, &mut sink).await {
+        // 断线时若正在上话，立即补收尾并清掉旧呼叫的媒体状态。
+        if let Some(ev) = sink.reset() {
+            session::log_activity(ev);
+        }
+        if let Some(publisher) = &nats {
+            publisher.set_online(false);
+        }
+
+        match result {
             Ok(CallEnd::Hangup) => {
                 tracing::info!("已挂断，退出");
+                flush_nats(&nats).await;
                 return Ok(());
             }
             Ok(CallEnd::Disconnected(why)) => {
@@ -86,6 +111,7 @@ async fn main() -> Result<()> {
             }
             Err(SessionError::Fatal(e)) => {
                 tracing::error!("{e:#}");
+                flush_nats(&nats).await;
                 return Err(e);
             }
             Err(SessionError::Retry(e)) => tracing::warn!("连接失败: {e:#}"),
@@ -96,6 +122,7 @@ async fn main() -> Result<()> {
             _ = tokio::time::sleep(backoff) => {}
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("退出");
+                flush_nats(&nats).await;
                 return Ok(());
             }
         }
@@ -103,8 +130,23 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run_call(cfg: &Config, sink: &mut AudioSink) -> session::Result<CallEnd> {
+async fn run_call(
+    cfg: &Config,
+    sink: &mut AudioSink,
+    nats: Option<&NatsPublisher>,
+) -> session::Result<CallEnd> {
     let mut session = Session::connect(cfg).await?;
     session.handshake().await?;
+    if let Some(publisher) = nats {
+        publisher.set_online(true);
+    }
     session.run(sink).await
+}
+
+async fn flush_nats(nats: &Option<NatsPublisher>) {
+    if let Some(publisher) = nats
+        && let Err(e) = publisher.flush().await
+    {
+        tracing::warn!("刷新 NATS 待发消息失败: {e:#}");
+    }
 }

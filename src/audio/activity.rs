@@ -76,6 +76,12 @@ impl ActivityDetector {
         }
     }
 
+    /// 当前帧是否超过活动门限。流式输出用它立即丢弃静音帧；活动状态的结束仍由
+    /// [`push`](Self::push) 的 hang time 判断，避免短暂停顿被算成新的一次上话。
+    pub fn is_loud(&self, rms: f32) -> bool {
+        rms > self.threshold
+    }
+
     /// 喂一帧，返回状态变化（没变化则 None）。
     pub fn push(&mut self, rms: f32) -> Option<Activity> {
         self.peak_rms = self.peak_rms.max(rms);
