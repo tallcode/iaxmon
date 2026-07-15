@@ -84,10 +84,28 @@ async fn main() -> Result<()> {
         None => AudioSink::new(&cfg.activity)?,
     };
     let mut backoff = BACKOFF_INITIAL;
+    // 顶层统一接管停止信号，覆盖握手/重连/退避等所有状态 —— run() 内部那个只在
+    // 已连上时才生效。biased 让 run_call 优先：已连上时收到 SIGINT 仍走 run() 的
+    // 优雅挂断路径，只有它没接住的状态才落到这里。
+    let mut shutdown = Box::pin(shutdown_signal());
 
     loop {
         let started = Instant::now();
-        let result = run_call(&cfg, &mut sink, nats.as_ref()).await;
+        let result = tokio::select! {
+            biased;
+            r = run_call(&cfg, &mut sink, nats.as_ref()) => r,
+            _ = &mut shutdown => {
+                tracing::info!("收到停止信号，退出");
+                if let Some(ev) = sink.reset() {
+                    session::log_activity(ev);
+                }
+                if let Some(publisher) = &nats {
+                    publisher.set_online(false);
+                }
+                flush_nats(&nats).await;
+                return Ok(());
+            }
+        };
 
         // 断线时若正在上话，立即补收尾并清掉旧呼叫的媒体状态。
         if let Some(ev) = sink.reset() {
@@ -120,7 +138,7 @@ async fn main() -> Result<()> {
         tracing::info!("{} 秒后重连", backoff.as_secs());
         tokio::select! {
             _ = tokio::time::sleep(backoff) => {}
-            _ = tokio::signal::ctrl_c() => {
+            _ = &mut shutdown => {
                 tracing::info!("退出");
                 flush_nats(&nats).await;
                 return Ok(());
@@ -128,6 +146,31 @@ async fn main() -> Result<()> {
         }
         backoff = (backoff * 2).min(BACKOFF_MAX);
     }
+}
+
+/// 完成于 SIGINT 或（Unix 上）SIGTERM。docker `stop` 默认发 SIGTERM，
+/// 只监听 ctrl_c（=SIGINT）会导致容器停止时干等宽限期后被强杀。
+#[cfg(unix)]
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            // 装不上 SIGTERM 处理器就退而只等 SIGINT，别让程序起不来。
+            tracing::warn!("无法注册 SIGTERM 处理器: {e}，仅监听 Ctrl-C");
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 async fn run_call(
