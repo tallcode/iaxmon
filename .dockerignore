@@ -1,0 +1,21 @@
+# 构建产物：巨大且与目标平台无关，绝不进构建上下文
+/target
+
+# 本地配置含密码，绝不烘进镜像；运行时用 volume 挂载
+config.toml
+
+# 版本库与元数据
+/.git
+/.gitignore
+
+# 文档与编辑器垃圾
+*.md
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 容器编排文件本身不需要进构建上下文
+Dockerfile
+.dockerignore
+docker-compose.yml

@@ -1,0 +1,46 @@
+# iaxmon + NATS 一体启动。
+#
+# 使用前：把 config.toml 里的 [nats] servers 指向本编排内的 nats 服务，例如
+#   [nats]
+#   servers = ["nats://nats:4222"]
+#   subject_prefix = "iaxmon.nodes.1999"
+# 其余 [server]/[auth]/[caller]/[call] 照常填你的 AllStarLink 节点凭据。
+#
+#   docker compose up -d --build      启动
+#   docker compose logs -f iaxmon     看上话日志
+#   docker compose down               停止
+
+services:
+  nats:
+    image: nats:2.10-alpine
+    # -m 8222 打开 HTTP 监控端口，仅供健康检查与排障用。
+    command: ["-m", "8222"]
+    ports:
+      - "4222:4222"   # 客户端口；给仓库外的 Gateway/调试用，纯内部可删
+      - "8222:8222"   # 监控端口，可删
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 2s
+
+  iaxmon:
+    build: .
+    image: iaxmon:latest
+    depends_on:
+      nats:
+        # 等 NATS healthy 再起，否则首连失败会让容器退出重启。
+        condition: service_healthy
+    volumes:
+      # 只读挂载本地配置；密码不进镜像。改配置后 `docker compose restart iaxmon` 生效。
+      - ./config.toml:/app/config.toml:ro
+    restart: unless-stopped
+    # SIGTERM（docker 默认）现在也能干净快速退出并 flush NATS。这里特意改发 SIGINT，
+    # 因为已连上时 SIGINT 会额外触发 IAX HANGUP、主动向节点挂断，比 SIGTERM 更礼貌。
+    stop_signal: SIGINT
+    # 收尾很快（等 ACK 0.5s + flush 2s），10s 宽限绰绰有余。
+    stop_grace_period: 10s
+    # 需要更详细日志时取消下一行注释（覆盖镜像默认 CMD）。
+    # command: ["--nats", "--config", "/app/config.toml", "--verbose"]
