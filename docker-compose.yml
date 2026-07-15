@@ -27,8 +27,11 @@ services:
       start_period: 2s
 
   iaxmon:
-    build: .
-    image: iaxmon:latest
+    # 由 GitHub Actions 构建、推送到 GitHub Packages 的远程镜像。
+    # 拉取：docker compose pull iaxmon（私有包需先 docker login ghcr.io）。
+    image: ghcr.io/tallcode/iaxmon:latest
+    # 本地改代码想自己构建时，取消下面一行注释（会覆盖上面的远程镜像）。
+    # build: .
     depends_on:
       nats:
         # 等 NATS healthy 再起，否则首连失败会让容器退出重启。
