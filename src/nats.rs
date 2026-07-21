@@ -4,12 +4,13 @@ use crate::config::NatsCfg;
 use anyhow::{Context, Result, anyhow};
 use async_nats::connection::State as ConnectionState;
 use futures_util::StreamExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, oneshot, watch};
 
 const PROTOCOL_VERSION: u8 = 1;
 const AUDIO_MESSAGE_TYPE: u8 = 1;
@@ -17,6 +18,7 @@ const PUBLISH_QUEUE_CAPACITY: usize = 256;
 /// 音频不占用最后几个槽位，确保 start/stop/state 总能按顺序排进同一队列。
 const CONTROL_RESERVE: usize = 8;
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+const LISTENER_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, Serialize)]
 struct PublisherState {
@@ -24,6 +26,7 @@ struct PublisherState {
     kind: &'static str,
     online: bool,
     speaking: bool,
+    listeners: usize,
 }
 
 impl Default for PublisherState {
@@ -32,8 +35,22 @@ impl Default for PublisherState {
             kind: "state",
             online: false,
             speaking: false,
+            listeners: 0,
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct ListenerReport {
+    #[serde(rename = "type")]
+    kind: String,
+    gateway_id: String,
+    count: usize,
+}
+
+struct GatewayListeners {
+    count: usize,
+    expires_at: Instant,
 }
 
 enum Command {
@@ -49,6 +66,7 @@ struct Subjects {
     audio: String,
     events: String,
     snapshot: String,
+    listeners: String,
 }
 
 impl Subjects {
@@ -57,6 +75,7 @@ impl Subjects {
             audio: format!("{prefix}.audio"),
             events: format!("{prefix}.events"),
             snapshot: format!("{prefix}.snapshot"),
+            listeners: format!("{prefix}.listeners"),
         }
     }
 }
@@ -67,10 +86,11 @@ pub struct NatsPublisher {
     commands: mpsc::Sender<Command>,
     sequence: Arc<AtomicU32>,
     dropped: Arc<AtomicU64>,
+    audience: watch::Receiver<usize>,
 }
 
 impl NatsPublisher {
-    pub async fn connect(cfg: &NatsCfg) -> Result<Self> {
+    pub async fn connect(cfg: &NatsCfg, subject_prefix: &str) -> Result<Self> {
         let servers = cfg
             .servers
             .iter()
@@ -110,30 +130,43 @@ impl NatsPublisher {
             .connect(servers)
             .await
             .context("连接 NATS 集群失败")?;
-        let subjects = Subjects::new(&cfg.subject_prefix);
+        let subjects = Subjects::new(subject_prefix);
         let snapshots = client
             .subscribe(subjects.snapshot.clone())
             .await
             .context("订阅 NATS 状态快照 subject 失败")?;
+        let listeners = client
+            .subscribe(subjects.listeners.clone())
+            .await
+            .context("订阅 NATS Gateway 监听人数 subject 失败")?;
 
         let (command_tx, command_rx) = mpsc::channel(PUBLISH_QUEUE_CAPACITY);
+        let (audience_tx, audience_rx) = watch::channel(0);
         tokio::spawn(run_publisher(
             client,
             subjects.clone(),
             command_rx,
             snapshots,
+            listeners,
+            audience_tx,
+            Duration::from_secs(cfg.listener_lease_secs),
         ));
 
         tracing::info!(
             "NATS 发布已启用: {} ({} 个集群入口)",
-            cfg.subject_prefix,
+            subject_prefix,
             cfg.servers.len()
         );
         Ok(Self {
             commands: command_tx,
             sequence: Arc::new(AtomicU32::new(0)),
             dropped: Arc::new(AtomicU64::new(0)),
+            audience: audience_rx,
         })
+    }
+
+    pub fn audience(&self) -> watch::Receiver<usize> {
+        self.audience.clone()
     }
 
     pub fn set_online(&self, online: bool) {
@@ -189,8 +222,15 @@ async fn run_publisher(
     subjects: Subjects,
     mut commands: mpsc::Receiver<Command>,
     mut snapshots: async_nats::Subscriber,
+    mut listener_reports: async_nats::Subscriber,
+    audience_tx: watch::Sender<usize>,
+    listener_lease: Duration,
 ) {
     let mut state = PublisherState::default();
+    let mut gateways = HashMap::<String, GatewayListeners>::new();
+    let mut listener_sweep = tokio::time::interval(LISTENER_SWEEP_INTERVAL);
+    listener_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    listener_sweep.tick().await;
 
     loop {
         tokio::select! {
@@ -246,9 +286,54 @@ async fn run_publisher(
                     }
                 }
             }
+            Some(message) = listener_reports.next() => {
+                match serde_json::from_slice::<ListenerReport>(&message.payload) {
+                    Ok(report) if report.kind == "listeners" && !report.gateway_id.is_empty() => {
+                        if report.count == 0 {
+                            gateways.remove(&report.gateway_id);
+                        } else {
+                            gateways.insert(report.gateway_id, GatewayListeners {
+                                count: report.count,
+                                expires_at: Instant::now() + listener_lease,
+                            });
+                        }
+                        update_audience(&client, &subjects, &mut state, &gateways, &audience_tx).await;
+                    }
+                    Ok(_) => tracing::warn!("忽略格式不正确的 Gateway 监听人数消息"),
+                    Err(error) => tracing::warn!("忽略无法解析的 Gateway 监听人数消息: {error}"),
+                }
+            }
+            _ = listener_sweep.tick() => {
+                let now = Instant::now();
+                gateways.retain(|_, gateway| gateway.expires_at > now);
+                update_audience(&client, &subjects, &mut state, &gateways, &audience_tx).await;
+            }
             else => return,
         }
     }
+}
+
+async fn update_audience(
+    client: &async_nats::Client,
+    subjects: &Subjects,
+    state: &mut PublisherState,
+    gateways: &HashMap<String, GatewayListeners>,
+    audience_tx: &watch::Sender<usize>,
+) {
+    let listeners = gateways
+        .values()
+        .fold(0usize, |sum, gateway| sum.saturating_add(gateway.count));
+    if listeners == state.listeners {
+        return;
+    }
+    state.listeners = listeners;
+    audience_tx.send_replace(listeners);
+    let prefix = subjects
+        .listeners
+        .strip_suffix(".listeners")
+        .unwrap_or(&subjects.listeners);
+    tracing::info!("[{prefix}] 当前监听人数: {listeners}");
+    publish_json(client, &subjects.events, state).await;
 }
 
 async fn publish_json<T: Serialize>(client: &async_nats::Client, subject: &str, value: &T) {
@@ -290,5 +375,6 @@ mod tests {
         assert_eq!(subjects.audio, "iaxmon.nodes.1999.audio");
         assert_eq!(subjects.events, "iaxmon.nodes.1999.events");
         assert_eq!(subjects.snapshot, "iaxmon.nodes.1999.snapshot");
+        assert_eq!(subjects.listeners, "iaxmon.nodes.1999.listeners");
     }
 }

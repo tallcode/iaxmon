@@ -29,17 +29,20 @@ FROM debian:bookworm-slim AS runtime
 
 # libasound2：cpal 的运行时动态库依赖（--nats 模式不初始化设备，但二进制仍链接它）。
 # ca-certificates：仅当你把 NATS 换成 tls:// 时才用得上，留着无妨。
+# tini：PID 1 进程管理，确保信号正确转发给所有 iaxmon 子进程。
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libasound2 ca-certificates \
+    && apt-get install -y --no-install-recommends libasound2 ca-certificates tini \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --no-create-home --uid 10001 iaxmon
 
 COPY --from=builder /app/target/release/iaxmon /usr/local/bin/iaxmon
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 WORKDIR /app
 USER iaxmon
 
 # 配置在运行时挂载到这里（见 docker-compose.yml），不烘进镜像。
-# 用 CMD 而非硬编码到 ENTRYPOINT，方便 compose 里追加 --verbose 等参数。
-ENTRYPOINT ["iaxmon"]
-CMD ["--nats", "--config", "/app/config.toml"]
+# tini 做 PID 1：转发信号、收割僵尸进程。
+# entrypoint 从配置中提取所有节点 ID，为每个节点启动一个 iaxmon 子进程。
+ENTRYPOINT ["tini", "--", "docker-entrypoint.sh"]

@@ -1,33 +1,15 @@
-# 复制为 config.toml 并填入自己的凭据
-[server]
-host = "your.allstar.node"
-port = 4569
+# 复制为 config.toml 并分别填写每个节点的 IAX 凭据。
+# 选择一个节点启动，例如：iaxmon --nats 1900
 
-[auth]
-username = "YOURCALL"
-secret   = "your-secret-here"
-
-[caller]
-callerid = "YOURCALL"
-
-[call]
-node = "1999"
-
-[audio]
-codec = "ulaw"
-
-[activity]
-threshold = 50.0   # RMS 阈值，超过即判定有人上话
-hang_ms = 500      # 静音多久判定上话结束
-
-# 只有使用 --nats 时才需要；servers 可填写同一集群的多个入口。
 [nats]
 servers = [
   "nats://nats-1.internal:4222",
   "nats://nats-2.internal:4222",
   "nats://nats-3.internal:4222",
 ]
-subject_prefix = "iaxmon.nodes.1999"
+subject_root = "iaxmon.nodes"
+listener_lease_secs = 45    # Gateway 心跳超过此时间未更新，监听人数自动过期
+idle_disconnect_secs = 60   # 每个节点无人收听持续此时间后断开自己的 IAX
 
 # 可选认证方式一：用户名和密码必须同时配置。
 # username = "iaxmon"
@@ -35,3 +17,33 @@ subject_prefix = "iaxmon.nodes.1999"
 
 # 可选认证方式二：token，不能和 username/password 同时配置。
 # token = "your-nats-token"
+
+# 上话活动检测（全局，所有节点共用）。
+# 默认 threshold=50.0 / hang_ms=500，通常不需要改。
+# [activity]
+# threshold = 50.0   # RMS 阈值，超过即判定有人上话
+# hang_ms = 500      # 静音多久判定上话结束
+
+[[nodes]]
+id = "1900"                # 节点 ID，同时作为 IAX2 呼叫的目标 extension
+# 可选：CALLING NAME IE。不填时默认使用 auth.username。
+# callerid = "YOURCALL"
+
+[nodes.server]
+host = "node-1900.example"
+port = 4569
+
+[nodes.auth]
+username = "YOURCALL-1900"
+secret = "your-1900-secret"
+
+[[nodes]]
+id = "1800"
+
+[nodes.server]
+host = "node-1800.example" # 可以和 1900 使用完全不同的服务器
+port = 4569
+
+[nodes.auth]
+username = "YOURCALL-1800"
+secret = "your-1800-secret"

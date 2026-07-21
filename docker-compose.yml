@@ -3,8 +3,9 @@
 # 使用前：把 config.toml 里的 [nats] servers 指向本编排内的 nats 服务，例如
 #   [nats]
 #   servers = ["nats://nats:4222"]
-#   subject_prefix = "iaxmon.nodes.1999"
-# 其余 [server]/[auth]/[caller]/[call] 照常填你的 AllStarLink 节点凭据。
+#   subject_root = "iaxmon.nodes"
+# 其余 [[nodes]] 照常填你的 AllStarLink 节点凭据。
+# 容器启动时自动读取配置中的所有 [[nodes]]，为每个节点启动一个 iaxmon 子进程。
 #
 #   docker compose up -d --build      启动
 #   docker compose logs -f iaxmon     看上话日志
@@ -31,7 +32,7 @@ services:
     # 拉取：docker compose pull iaxmon（私有包需先 docker login ghcr.io）。
     image: ghcr.io/tallcode/iaxmon:latest
     # 本地改代码想自己构建时，取消下面一行注释（会覆盖上面的远程镜像）。
-    # build: .
+    build: .
     depends_on:
       nats:
         # 等 NATS healthy 再起，否则首连失败会让容器退出重启。
@@ -40,10 +41,10 @@ services:
       # 只读挂载本地配置；密码不进镜像。改配置后 `docker compose restart iaxmon` 生效。
       - ./config.toml:/app/config.toml:ro
     restart: unless-stopped
-    # SIGTERM（docker 默认）现在也能干净快速退出并 flush NATS。这里特意改发 SIGINT，
-    # 因为已连上时 SIGINT 会额外触发 IAX HANGUP、主动向节点挂断，比 SIGTERM 更礼貌。
+    # SIGTERM（docker 默认）由 tini 转发给 entrypoint，再分发给所有 iaxmon 子进程。
+    # 这里特意改发 SIGINT，因为已连上时 SIGINT 会额外触发 IAX HANGUP、主动向节点挂断。
     stop_signal: SIGINT
     # 收尾很快（等 ACK 0.5s + flush 2s），10s 宽限绰绰有余。
     stop_grace_period: 10s
-    # 需要更详细日志时取消下一行注释（覆盖镜像默认 CMD）。
-    # command: ["--nats", "--config", "/app/config.toml", "--verbose"]
+    # entrypoint 会把额外参数传给每个节点进程；需要协议日志时取消下一行注释。
+    # command: ["--verbose"]

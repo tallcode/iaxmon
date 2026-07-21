@@ -2,7 +2,7 @@
 
 use crate::audio::AudioSink;
 use crate::audio::activity::Activity;
-use crate::config::Config;
+use crate::config::NodeConfig;
 use crate::proto::consts::{
     IAX_PROTO_VERSION, auth_method, control, format, frame_type, iax, ie as ie_id,
 };
@@ -43,6 +43,8 @@ const STATS_INTERVAL: Duration = Duration::from_secs(30);
 pub enum CallEnd {
     /// 用户 Ctrl-C
     Hangup,
+    /// NATS Gateway 连续一段时间无人收听
+    Idle,
     /// 可重连的断线
     Disconnected(String),
 }
@@ -71,6 +73,35 @@ impl From<anyhow::Error> for SessionError {
 }
 
 pub type Result<T> = std::result::Result<T, SessionError>;
+
+async fn wait_for_no_listeners(
+    audience: Option<&mut tokio::sync::watch::Receiver<usize>>,
+    idle_timeout: Duration,
+) {
+    let Some(audience) = audience else {
+        std::future::pending::<()>().await;
+        return;
+    };
+
+    loop {
+        while *audience.borrow() > 0 {
+            if audience.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+
+        let timer = tokio::time::sleep(idle_timeout);
+        tokio::pin!(timer);
+        tokio::select! {
+            _ = &mut timer => return,
+            changed = audience.changed() => {
+                if changed.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
+    }
+}
 
 /// 半个 16 位窗口。候选值和基准差出这么多，就说明它其实在相邻的窗口里。
 const HALF_WINDOW: i32 = 0x8000;
@@ -129,7 +160,7 @@ impl VoiceClock {
 }
 
 pub struct Session<'a> {
-    cfg: &'a Config,
+    cfg: &'a NodeConfig,
     transport: Transport,
     source_call: u16,
     dest_call: u16,
@@ -143,7 +174,7 @@ pub struct Session<'a> {
 }
 
 impl<'a> Session<'a> {
-    pub async fn connect(cfg: &'a Config) -> Result<Self> {
+    pub async fn connect(cfg: &'a NodeConfig) -> Result<Self> {
         let transport = Transport::connect(&cfg.server.host, cfg.server.port).await?;
         Ok(Self {
             cfg,
@@ -160,7 +191,7 @@ impl<'a> Session<'a> {
 
     /// NEW → (CALLTOKEN → NEW) → AUTHREQ → AUTHREP → ACCEPT
     pub async fn handshake(&mut self) -> Result<()> {
-        tracing::debug!("呼叫 {} @ {}", self.cfg.call.node, self.transport.peer());
+        tracing::debug!("呼叫 {} @ {}", self.cfg.id, self.transport.peer());
 
         let ies = new_ies(self.cfg, &[]);
         let reply = self.send_reliable(frame_type::IAX, iax::NEW, ies).await?;
@@ -274,7 +305,12 @@ impl<'a> Session<'a> {
     }
 
     /// 握手完成后的主循环。
-    pub async fn run(&mut self, sink: &mut AudioSink) -> Result<CallEnd> {
+    pub async fn run(
+        &mut self,
+        sink: &mut AudioSink,
+        audience: Option<&mut tokio::sync::watch::Receiver<usize>>,
+        idle_timeout: Duration,
+    ) -> Result<CallEnd> {
         let mut ticker = interval(TICK);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut stats = interval(STATS_INTERVAL);
@@ -283,6 +319,8 @@ impl<'a> Session<'a> {
 
         let mut sigint = Box::pin(tokio::signal::ctrl_c());
         let mut last_rx = Instant::now();
+        let idle = wait_for_no_listeners(audience, idle_timeout);
+        tokio::pin!(idle);
 
         loop {
             tokio::select! {
@@ -313,9 +351,14 @@ impl<'a> Session<'a> {
                     );
                 }
                 _ = &mut sigint => {
-                    tracing::info!("收到 Ctrl-C，挂断");
+                    tracing::info!("[{}] 收到 Ctrl-C，挂断", self.cfg.id);
                     self.hangup().await;
                     return Ok(CallEnd::Hangup);
+                }
+                _ = &mut idle => {
+                    tracing::info!("[{}] 连续 {} 秒无人收听，断开 IAX", self.cfg.id, idle_timeout.as_secs());
+                    self.hangup().await;
+                    return Ok(CallEnd::Idle);
                 }
             }
         }
@@ -339,7 +382,7 @@ impl<'a> Session<'a> {
                 }
                 let ts = self.clock.extend(m.timestamp);
                 if let Some(ev) = sink.push_frame(ts, m.payload) {
-                    log_activity(ev);
+                    log_activity(ev, &self.cfg.id);
                 }
                 Ok(None)
             }
@@ -412,10 +455,10 @@ impl<'a> Session<'a> {
             frame_type::CONTROL => {
                 self.send_ack(f.timestamp).await?;
                 match f.subclass {
-                    control::RINGING => tracing::info!("振铃"),
+                    control::RINGING => tracing::info!("[{}] 振铃", self.cfg.id),
                     control::ANSWER => {
                         self.answered = true;
-                        tracing::info!("对端接听，开始收音频");
+                        tracing::info!("[{}] 对端接听，开始收音频", self.cfg.id);
                     }
                     control::HANGUP => {
                         return Ok(Some(CallEnd::Disconnected("对端挂断".into())));
@@ -435,7 +478,7 @@ impl<'a> Session<'a> {
                     // full voice frame 带完整时间戳，拿它给 mini frame 的时钟对表
                     self.clock.sync(f.timestamp);
                     if let Some(ev) = sink.push_frame(f.timestamp, f.payload) {
-                        log_activity(ev);
+                        log_activity(ev, &self.cfg.id);
                     }
                 }
             }
@@ -587,12 +630,12 @@ impl<'a> Session<'a> {
 ///
 /// 只发这七个，别的一概不发 —— 理由见 DESIGN.md §2.2。CALLING NAME 不能省，
 /// ASL 的 dialplan 在它为空时会直接挂断。
-fn new_ies(cfg: &Config, token: &[u8]) -> Ies {
+fn new_ies(cfg: &NodeConfig, token: &[u8]) -> Ies {
     let mut ies = Ies::new();
     ies.push(Ie::u16(ie_id::VERSION, IAX_PROTO_VERSION));
     ies.push(Ie::string(ie_id::USERNAME, &cfg.auth.username));
-    ies.push(Ie::string(ie_id::CALLED_NUMBER, &cfg.call.node));
-    ies.push(Ie::string(ie_id::CALLING_NAME, &cfg.caller.callerid));
+    ies.push(Ie::string(ie_id::CALLED_NUMBER, &cfg.id));
+    ies.push(Ie::string(ie_id::CALLING_NAME, cfg.callerid_or()));
     ies.push(Ie::u32(ie_id::CAPABILITY, format::ULAW));
     ies.push(Ie::u32(ie_id::FORMAT, format::ULAW));
     ies.push(Ie {
@@ -606,17 +649,17 @@ fn new_ies(cfg: &Config, token: &[u8]) -> Ies {
 ///
 /// 时长用帧数换算（媒体时钟，精确），不用两个墙上时间相减 —— 后者会把网络抖动
 /// 和调度延迟算进去。
-pub fn log_activity(ev: Activity) {
+pub fn log_activity(ev: Activity, node_id: &str) {
     const FMT: &str = "%H:%M:%S";
     match ev {
         Activity::Started => {
             let now = Local::now();
-            tracing::info!("▶ {}", now.format(FMT));
+            tracing::info!("[{node_id}] ▶ {}", now.format(FMT));
         }
         Activity::Ended { frames } => {
             let 时长 = Activity::duration_secs(frames);
             let end = Local::now();
-            tracing::info!("■ {}   持续 {:.1} 秒", end.format(FMT), 时长);
+            tracing::info!("[{node_id}] ■ {}   持续 {:.1} 秒", end.format(FMT), 时长);
         }
     }
 }
@@ -673,19 +716,16 @@ fn describe(f: &FullFrame) -> String {
 mod tests {
     use super::*;
 
-    fn 样例配置() -> Config {
+    fn 样例配置() -> NodeConfig {
         toml::from_str(
             r#"
+            id = "1999"
             [server]
             host = "node.example"
             port = 4569
             [auth]
             username = "N0CALL"
             secret = "test-secret"
-            [caller]
-            callerid = "N0CALL"
-            [call]
-            node = "1999"
         "#,
         )
         .unwrap()
@@ -694,7 +734,7 @@ mod tests {
     /// NEW 帧的 IE 组成是和服务端 dialplan 直接挂钩的契约，逐字节锁住。
     ///
     /// 尤其是 CALLING NAME：ASL 的 dialplan 在它为空时会直接挂断（PROTOCOL.md §9.2），
-    /// 少发它的后果是彻底连不上。
+    /// 少发它的后果是彻底连不上。callerid 未显式配置时回落到 auth.username。
     #[test]
     fn new_帧的_ie_线格式() {
         let mut buf = Vec::new();
@@ -705,8 +745,9 @@ mod tests {
             vec![
                 0x0b, 0x02, 0x00, 0x02, // VERSION = 2
                 0x06, 0x06, b'N', b'0', b'C', b'A', b'L', b'L', // USERNAME
-                0x01, 0x04, b'1', b'9', b'9', b'9', // CALLED NUMBER
-                0x04, 0x06, b'N', b'0', b'C', b'A', b'L', b'L', // CALLING NAME
+                0x01, 0x04, b'1', b'9', b'9', b'9', // CALLED NUMBER = id
+                0x04, 0x06, b'N', b'0', b'C', b'A', b'L',
+                b'L', // CALLING NAME = username (callerid 缺省)
                 0x08, 0x04, 0x00, 0x00, 0x00, 0x04, // CAPABILITY = ulaw
                 0x09, 0x04, 0x00, 0x00, 0x00, 0x04, // FORMAT = ulaw
                 0x36, 0x00, // CALLTOKEN，空 = 「请给我一个令牌」
@@ -869,5 +910,35 @@ mod tests {
             c.extend(0xffff);
             assert_eq!(c.extend(0x0000), i << 16);
         }
+    }
+
+    #[tokio::test]
+    async fn 无监听达到防抖时间后结束等待() {
+        let (_tx, mut rx) = tokio::sync::watch::channel(0usize);
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            wait_for_no_listeners(Some(&mut rx), Duration::from_millis(10)),
+        )
+        .await
+        .expect("无人监听时应在防抖时间后结束");
+    }
+
+    #[tokio::test]
+    async fn 防抖期间恢复监听会取消挂断() {
+        let (tx, mut rx) = tokio::sync::watch::channel(0usize);
+        let waiter = tokio::spawn(async move {
+            wait_for_no_listeners(Some(&mut rx), Duration::from_millis(40)).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        tx.send_replace(1);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished(), "恢复监听后不应沿用旧的防抖计时");
+
+        tx.send_replace(0);
+        tokio::time::timeout(Duration::from_millis(100), waiter)
+            .await
+            .expect("再次无人监听后应重新开始防抖")
+            .expect("监听等待任务不应 panic");
     }
 }

@@ -1,14 +1,14 @@
 # iaxmon
 
-用 Rust 写的 IAX2 **监听**客户端 —— 连接 AllStarLink 节点，把下行语音解码后从扬声器放出来。功能对标 DVSwitch Mobile 的收听部分。
+用 Rust 写的 IAX2 **监听**客户端 —— 一份配置可以定义多个 AllStarLink 节点，每个进程按节点 ID 启动其中一个，把下行语音发布到 NATS 或从扬声器播放。
 
 只收不发：没有麦克风，没有 PTT，不会占用信道。挂着当守听台用。
 
 ```
-振铃
-对端接听，开始收音频
-▶ 22:38:01
-■ 22:38:07   持续 5.6 秒
+[1900] 振铃
+[1900] 对端接听，开始收音频
+[1900] ▶ 22:38:01
+[1900] ■ 22:38:07   持续 5.6 秒
 ```
 
 ## 范围
@@ -21,6 +21,7 @@
 - 接收 G.711 μ-law 语音，抖动缓冲，解码，播放
 - 上话活动检测：打出「谁在什么时候上话、持续多久」
 - 断线后指数退避自动重连
+- 多进程按节点部署，连接、重连和按需挂断完全隔离
 - Ctrl-C 正常挂断
 
 **不做什么**
@@ -41,48 +42,69 @@
 ```bash
 cp config.example.toml config.toml
 $EDITOR config.toml          # 填入你自己的服务器和凭据
-cargo run --release
+cargo run --release                  # 不传节点：列出配置中的节点
+cargo run --release -- 1900          # 启动 1900
 ```
 
 节点会先振铃约 10 秒（服务端在放提示音），然后接通，之后就能听到声音了。
 
 ### Core NATS 音频发布
 
-加 `--nats` 把有声音频发布到 Core NATS；该模式不会初始化或使用本机声卡：
+加 `--nats` 把一个或多个节点的有声音频发布到 Core NATS；该模式不会初始化或使用本机声卡：
 
 ```bash
-iaxmon --nats
+iaxmon --nats 1900
 ```
 
 使用 `--nats` 时，`config.toml` 必须包含 `[nats]`；缺少或配置无效会直接报错，且不会
 建立 IAX 呼叫。NATS 模式只发布超过活动阈值的 PCMU 帧，静音期间没有音频消息。
+每个进程只运行命令行指定的节点。没有浏览器监听时不建立 IAX 呼叫；人数持续为 0
+达到防抖时间后挂断，新监听者出现时自动重新连接。需要同时运行 1900 和 1800 时启动
+两个进程，它们可以共用同一份配置：
+
+```bash
+iaxmon --nats 1900
+iaxmon --nats 1800
+```
+
+不传节点 ID 时不会启动任何连接，只打印配置文件里的可用节点。传入不存在的节点会
+报错并附带可用节点列表。
 
 集群配置、subjects、二进制格式和 Gateway 消费约定见 **[NATS.md](NATS.md)**。
 
 ## 配置
 
+配置使用 `[[nodes]]`；下面只展示结构，完整的 1900/1800 双节点示例见
+**[config.example.toml](config.example.toml)**：
+
 ```toml
-[server]
-host = "your.allstar.node"
-port = 4569                  # IAX2 默认端口
+[nats]
+servers = ["nats://nats:4222"]
+subject_root = "iaxmon.nodes"
 
-[auth]
-username = "YOURCALL"        # 对应服务端 iax.conf 的 section 名
-secret   = "your-secret"
+[[nodes]]
+id = "1900"
+callerid = "YOURCALL"       # 可选；缺省回落到 auth.username
+[nodes.server]
+host = "node-1900.example"
+port = 4569
+[nodes.auth]
+username = "YOURCALL-1900"
+secret = "secret-1900"
 
-[caller]
-callerid = "YOURCALL"        # 作为 CALLING NAME 发出
-
-[call]
-node = "1999"                # 要呼叫的 extension
-
-[audio]
-codec = "ulaw"
-
-[activity]
-threshold = 50.0             # RMS 阈值，超过即判定有人上话
-hang_ms = 500                # 静音多久判定上话结束
+[[nodes]]
+id = "1800"
+[nodes.server]
+host = "node-1800.example"
+port = 4569
+[nodes.auth]
+username = "YOURCALL-1800"
+secret = "secret-1800"
 ```
+
+subjects 自动生成为 `iaxmon.nodes.1900.*` 和 `iaxmon.nodes.1800.*`。旧版顶层
+`[server]`/`[auth]`/`[caller]`/`[call]` 配置和单节点 `nats.subject_prefix` 仍可继续使用；
+不能在同一文件里混用旧版顶层节点配置和 `[[nodes]]`。
 
 > **`config.toml` 含密码，已被 `.gitignore` 排除，不要提交。**
 >
